@@ -1,0 +1,68 @@
+<!--
+  ANDROID MANIFEST ADDITIONS
+  ==========================
+  After running `flutter create .`, open:
+    android/app/src/main/AndroidManifest.xml
+
+  Add these permissions INSIDE the <manifest> tag, BEFORE the <application> tag:
+-->
+
+<!-- SMS Permissions (required for SMS Auto-Tracking) -->
+<uses-permission android:name="android.permission.READ_SMS"/>
+<uses-permission android:name="android.permission.RECEIVE_SMS"/>
+
+<!-- Speech Recognition (required for voice input) -->
+<uses-permission android:name="android.permission.RECORD_AUDIO"/>
+
+<!-- Storage (required for CSV export) -->
+<uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"/>
+<uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"/>
+
+<!-- Internet (not required but useful for speech-to-text online mode) -->
+<uses-permission android:name="android.permission.INTERNET"/>
+
+<!--
+  Additionally, inside the <application> tag, add this receiver for background SMS:
+
+  <receiver android:name="com.shounakmulay.telephony.sms.IncomingSmsReceiver"
+      android:permission="android.permission.BROADCAST_SMS"
+      android:exported="true">
+      <intent-filter>
+          <action android:name="android.provider.Telephony.SMS_RECEIVED"/>
+      </intent-filter>
+  </receiver>
+-->
+
+<!--
+  FULL EXAMPLE AndroidManifest.xml structure:
+
+  <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+      <uses-permission android:name="android.permission.READ_SMS"/>
+      <uses-permission android:name="android.permission.RECEIVE_SMS"/>
+      <uses-permission android:name="android.permission.RECORD_AUDIO"/>
+      <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"/>
+      <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"/>
+      <uses-permission android:name="android.permission.INTERNET"/>
+
+      <application
+          android:label="Money Tracker"
+          android:name="${applicationName}"
+          android:icon="@mipmap/ic_launcher">
+
+          <activity ...>
+              ...
+          </activity>
+
+          <receiver android:name="com.shounakmulay.telephony.sms.IncomingSmsReceiver"
+              android:permission="android.permission.BROADCAST_SMS"
+              android:exported="true">
+              <intent-filter>
+                  <action android:name="android.provider.Telephony.SMS_RECEIVED"/>
+              </intent-filter>
+          </receiver>
+
+          ...
+      </application>
+  </manifest>
+-->
