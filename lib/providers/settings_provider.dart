@@ -6,6 +6,7 @@ import 'dart:io';
 import '../database/db_helper.dart';
 import '../models/category.dart';
 import '../services/sms_service.dart';
+import '../services/sms_auto_saver.dart';
 
 class SettingsProvider with ChangeNotifier {
   final DbHelper _db = DbHelper();
@@ -15,18 +16,36 @@ class SettingsProvider with ChangeNotifier {
   bool _smsTrackingEnabled = false;
   String _currency = 'EGP';
   List<Category> _categories = [];
+  String _geminiApiKey = '';
+  int? _smsTargetAccountId;
+  int? _smsTargetExpenseCategoryId;
+  int? _smsTargetIncomeCategoryId;
 
   List<String> get smsKeywords => _smsKeywords;
   bool get smsTrackingEnabled => _smsTrackingEnabled;
   String get currency => _currency;
   List<Category> get categories => _categories;
+  String get geminiApiKey => _geminiApiKey;
+  bool get isGeminiConfigured => _geminiApiKey.isNotEmpty;
+  int? get smsTargetAccountId => _smsTargetAccountId;
+  int? get smsTargetExpenseCategoryId => _smsTargetExpenseCategoryId;
+  int? get smsTargetIncomeCategoryId => _smsTargetIncomeCategoryId;
 
   Future<void> loadSettings() async {
     final prefs = await SharedPreferences.getInstance();
-    _smsTrackingEnabled = prefs.getBool('sms_tracking_enabled') ?? false;
+    _smsTrackingEnabled = prefs.getBool(SmsAutoSaver.prefsKeyEnabled) ?? false;
     _currency = prefs.getString('currency') ?? 'EGP';
+    _geminiApiKey = prefs.getString('gemini_api_key') ?? '';
+    _smsTargetAccountId = prefs.getInt(SmsAutoSaver.prefsKeySmsAccountId);
+    _smsTargetExpenseCategoryId =
+        prefs.getInt(SmsAutoSaver.prefsKeySmsCategoryExpenseId);
+    _smsTargetIncomeCategoryId =
+        prefs.getInt(SmsAutoSaver.prefsKeySmsCategoryIncomeId);
     _smsKeywords = await _db.getSmsKeywords();
     _categories = await _db.getCategories();
+    // Mirror keywords into SharedPreferences so the background isolate
+    // can read them without hitting sqflite during cold start.
+    await prefs.setStringList(SmsAutoSaver.prefsKeyKeywords, _smsKeywords);
     notifyListeners();
   }
 
@@ -51,19 +70,54 @@ class SettingsProvider with ChangeNotifier {
     }
   }
 
+  Future<void> setSmsTargetAccount(int? accountId) async {
+    _smsTargetAccountId = accountId;
+    final prefs = await SharedPreferences.getInstance();
+    if (accountId == null) {
+      await prefs.remove(SmsAutoSaver.prefsKeySmsAccountId);
+    } else {
+      await prefs.setInt(SmsAutoSaver.prefsKeySmsAccountId, accountId);
+    }
+    notifyListeners();
+  }
+
+  Future<void> setSmsTargetExpenseCategory(int? categoryId) async {
+    _smsTargetExpenseCategoryId = categoryId;
+    final prefs = await SharedPreferences.getInstance();
+    if (categoryId == null) {
+      await prefs.remove(SmsAutoSaver.prefsKeySmsCategoryExpenseId);
+    } else {
+      await prefs.setInt(
+          SmsAutoSaver.prefsKeySmsCategoryExpenseId, categoryId);
+    }
+    notifyListeners();
+  }
+
+  Future<void> setSmsTargetIncomeCategory(int? categoryId) async {
+    _smsTargetIncomeCategoryId = categoryId;
+    final prefs = await SharedPreferences.getInstance();
+    if (categoryId == null) {
+      await prefs.remove(SmsAutoSaver.prefsKeySmsCategoryIncomeId);
+    } else {
+      await prefs.setInt(
+          SmsAutoSaver.prefsKeySmsCategoryIncomeId, categoryId);
+    }
+    notifyListeners();
+  }
+
   Future<void> addKeyword(String keyword) async {
     final trimmed = keyword.trim();
     if (trimmed.isEmpty || _smsKeywords.contains(trimmed)) return;
     await _db.addSmsKeyword(trimmed);
     _smsKeywords = await _db.getSmsKeywords();
-    _smsService.updateKeywords(_smsKeywords);
+    await _smsService.updateKeywords(_smsKeywords);
     notifyListeners();
   }
 
   Future<void> removeKeyword(String keyword) async {
     await _db.removeSmsKeyword(keyword);
     _smsKeywords = await _db.getSmsKeywords();
-    _smsService.updateKeywords(_smsKeywords);
+    await _smsService.updateKeywords(_smsKeywords);
     notifyListeners();
   }
 
@@ -71,6 +125,13 @@ class SettingsProvider with ChangeNotifier {
     _currency = currency;
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString('currency', currency);
+    notifyListeners();
+  }
+
+  Future<void> setGeminiApiKey(String key) async {
+    _geminiApiKey = key.trim();
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString('gemini_api_key', _geminiApiKey);
     notifyListeners();
   }
 

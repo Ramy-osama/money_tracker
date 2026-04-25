@@ -8,6 +8,7 @@ import 'providers/transaction_provider.dart';
 import 'providers/account_provider.dart';
 import 'providers/budget_provider.dart';
 import 'providers/settings_provider.dart';
+import 'providers/group_order_provider.dart';
 import 'services/notification_service.dart';
 
 void main() {
@@ -24,6 +25,7 @@ void main() {
         ChangeNotifierProvider(create: (_) => AccountProvider()),
         ChangeNotifierProvider(create: (_) => BudgetProvider()),
         ChangeNotifierProvider(create: (_) => SettingsProvider()),
+        ChangeNotifierProvider(create: (_) => GroupOrderProvider()),
       ],
       child: const AppInitializer(),
     ),
@@ -53,12 +55,14 @@ class _AppInitializerState extends State<AppInitializer> {
     final accountProvider = context.read<AccountProvider>();
     final budgetProvider = context.read<BudgetProvider>();
     final settingsProvider = context.read<SettingsProvider>();
+    final groupOrderProvider = context.read<GroupOrderProvider>();
 
     await Future.wait([
       txnProvider.loadData(),
       accountProvider.loadAccounts(),
       budgetProvider.loadData(),
       settingsProvider.loadSettings(),
+      groupOrderProvider.loadData(),
     ]);
 
     if (!kIsWeb) {

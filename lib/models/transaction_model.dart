@@ -9,6 +9,7 @@ class MoneyTransaction {
   final String source; // 'manual', 'sms', 'voice'
   final DateTime createdAt;
   final bool needsReview;
+  final int? parentId;
 
   MoneyTransaction({
     this.id,
@@ -21,7 +22,10 @@ class MoneyTransaction {
     this.source = 'manual',
     DateTime? createdAt,
     this.needsReview = false,
+    this.parentId,
   }) : createdAt = createdAt ?? DateTime.now();
+
+  bool get isChild => parentId != null;
 
   Map<String, dynamic> toMap() {
     return {
@@ -35,6 +39,7 @@ class MoneyTransaction {
       'source': source,
       'created_at': createdAt.toIso8601String(),
       'needs_review': needsReview ? 1 : 0,
+      'parent_id': parentId,
     };
   }
 
@@ -50,6 +55,7 @@ class MoneyTransaction {
       source: map['source'] as String? ?? 'manual',
       createdAt: DateTime.parse(map['created_at'] as String),
       needsReview: (map['needs_review'] as int?) == 1,
+      parentId: map['parent_id'] as int?,
     );
   }
 
@@ -63,6 +69,8 @@ class MoneyTransaction {
     DateTime? date,
     String? source,
     bool? needsReview,
+    int? parentId,
+    bool clearParentId = false,
   }) {
     return MoneyTransaction(
       id: id ?? this.id,
@@ -75,6 +83,7 @@ class MoneyTransaction {
       source: source ?? this.source,
       createdAt: createdAt,
       needsReview: needsReview ?? this.needsReview,
+      parentId: clearParentId ? null : (parentId ?? this.parentId),
     );
   }
 }

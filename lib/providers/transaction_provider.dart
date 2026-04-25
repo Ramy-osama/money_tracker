@@ -12,6 +12,7 @@ class TransactionProvider with ChangeNotifier {
   List<Category> _categories = [];
   DateTime _selectedMonth = DateTime.now();
   bool _isLoading = false;
+  Map<int, int> _childCounts = {};
 
   List<MoneyTransaction> get transactions => _transactions;
   Map<String, double> get monthSummary => _monthSummary;
@@ -42,10 +43,20 @@ class TransactionProvider with ChangeNotifier {
     final startDate = DateTime(_selectedMonth.year, _selectedMonth.month, 1);
     final endDate = DateTime(_selectedMonth.year, _selectedMonth.month + 1, 0, 23, 59, 59);
 
-    _transactions = await _db.getTransactions(
+    final all = await _db.getTransactions(
       startDate: startDate,
       endDate: endDate,
     );
+
+    // Show only top-level transactions in the main list
+    _transactions = all.where((t) => t.parentId == null).toList();
+
+    // Pre-load child counts for parent transactions
+    final parentIds = _transactions
+        .where((t) => t.id != null)
+        .map((t) => t.id!)
+        .toList();
+    _childCounts = await _db.getChildCounts(parentIds);
   }
 
   Future<void> _loadSummary() async {
@@ -61,6 +72,24 @@ class TransactionProvider with ChangeNotifier {
 
   Future<void> _loadCategories() async {
     _categories = await _db.getCategories();
+  }
+
+  /// Re-read categories from DB so newly added ones appear immediately.
+  Future<void> refreshCategories() async {
+    _categories = await _db.getCategories();
+    notifyListeners();
+  }
+
+  int getChildCount(int transactionId) => _childCounts[transactionId] ?? 0;
+
+  Future<List<MoneyTransaction>> getChildTransactions(int parentId) async {
+    return _db.getChildTransactions(parentId);
+  }
+
+  Future<void> addSubTransaction(MoneyTransaction child, int parentId) async {
+    final subTxn = child.copyWith(parentId: parentId);
+    await _db.insertSubTransaction(subTxn);
+    await loadData();
   }
 
   void setSelectedMonth(DateTime month) {

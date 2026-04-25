@@ -6,6 +6,7 @@ import '../../models/account.dart';
 import '../../providers/transaction_provider.dart';
 import '../../providers/account_provider.dart';
 import '../../utils/constants.dart';
+import '../../utils/currency_formatter.dart';
 
 class AddTransactionDialog extends StatefulWidget {
   final double? prefillAmount;
@@ -13,6 +14,7 @@ class AddTransactionDialog extends StatefulWidget {
   final String? prefillCategory;
   final String source;
   final MoneyTransaction? existingTransaction;
+  final MoneyTransaction? parentTransaction;
 
   const AddTransactionDialog({
     super.key,
@@ -21,9 +23,11 @@ class AddTransactionDialog extends StatefulWidget {
     this.prefillCategory,
     this.source = 'manual',
     this.existingTransaction,
+    this.parentTransaction,
   });
 
   bool get isEditing => existingTransaction != null;
+  bool get isSubTransaction => parentTransaction != null;
 
   @override
   State<AddTransactionDialog> createState() => _AddTransactionDialogState();
@@ -37,6 +41,7 @@ class _AddTransactionDialogState extends State<AddTransactionDialog> {
   String _type = 'expense';
   int? _categoryId;
   int? _accountId;
+  int? _selectedParentId;
   DateTime _date = DateTime.now();
 
   @override
@@ -50,7 +55,13 @@ class _AddTransactionDialogState extends State<AddTransactionDialog> {
       _type = txn.type;
       _categoryId = txn.categoryId;
       _accountId = txn.accountId;
+      _selectedParentId = txn.parentId;
       _date = txn.date;
+    } else if (widget.isSubTransaction) {
+      final parent = widget.parentTransaction!;
+      _type = parent.type;
+      _accountId = parent.accountId;
+      _date = parent.date;
     } else {
       if (widget.prefillAmount != null) {
         _amountController.text = widget.prefillAmount!.toStringAsFixed(2);
@@ -76,6 +87,11 @@ class _AddTransactionDialogState extends State<AddTransactionDialog> {
         }
       });
     }
+
+    // Ensure categories are fresh from DB (picks up any added in Settings)
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      context.read<TransactionProvider>().refreshCategories();
+    });
   }
 
   @override
@@ -107,18 +123,47 @@ class _AddTransactionDialogState extends State<AddTransactionDialog> {
               children: [
                 Row(
                   children: [
-                    Text(
-                      widget.isEditing ? 'Edit Transaction' : 'Add Transaction',
-                      style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
+                    Expanded(
+                      child: Text(
+                        widget.isEditing
+                            ? 'Edit Transaction'
+                            : widget.isSubTransaction
+                                ? 'Add Sub-Transaction'
+                                : 'Add Transaction',
+                        style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
+                      ),
                     ),
-                    const Spacer(),
                     IconButton(
                       icon: const Icon(Icons.close),
                       onPressed: () => Navigator.pop(context),
                     ),
                   ],
                 ),
-                const SizedBox(height: 16),
+                if (widget.isSubTransaction) ...[
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                    decoration: BoxDecoration(
+                      color: AppColors.primary.withValues(alpha: 0.08),
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    child: Row(
+                      children: [
+                        const Icon(Icons.subdirectory_arrow_right, size: 16, color: AppColors.primary),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: Text(
+                            'Under: ${widget.parentTransaction!.description.isNotEmpty ? widget.parentTransaction!.description : "Parent transaction"}',
+                            style: const TextStyle(fontSize: 13, color: AppColors.primary),
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                ],
+                const SizedBox(height: 4),
 
                 _buildTypeToggle(),
                 const SizedBox(height: 16),
@@ -205,6 +250,9 @@ class _AddTransactionDialogState extends State<AddTransactionDialog> {
                 ),
                 const SizedBox(height: 12),
 
+                if (!widget.isSubTransaction)
+                  _buildParentPicker(txnProvider),
+
                 ListTile(
                   contentPadding: EdgeInsets.zero,
                   leading: const Icon(Icons.calendar_today),
@@ -252,7 +300,11 @@ class _AddTransactionDialogState extends State<AddTransactionDialog> {
                           ),
                         ),
                         child: Text(
-                          widget.isEditing ? 'Save Changes' : 'Save Transaction',
+                          widget.isEditing
+                              ? 'Save Changes'
+                              : widget.isSubTransaction
+                                  ? 'Add Sub-Item'
+                                  : 'Save Transaction',
                           style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
                         ),
                       ),
@@ -328,6 +380,77 @@ class _AddTransactionDialogState extends State<AddTransactionDialog> {
     );
   }
 
+  Widget _buildParentPicker(TransactionProvider txnProvider) {
+    // Show top-level transactions of the same type as possible parents
+    // Exclude the current transaction when editing to prevent self-reference
+    final possibleParents = txnProvider.transactions.where((t) {
+      if (t.parentId != null) return false;
+      if (t.type != _type) return false;
+      if (widget.isEditing && t.id == widget.existingTransaction!.id) return false;
+      return true;
+    }).toList();
+
+    return Column(
+      children: [
+        DropdownButtonFormField<int?>(
+          value: _selectedParentId,
+          decoration: InputDecoration(
+            labelText: 'Parent Transaction (optional)',
+            border: OutlineInputBorder(
+              borderRadius: BorderRadius.circular(12),
+            ),
+            filled: true,
+            fillColor: Colors.grey[50],
+            suffixIcon: _selectedParentId != null
+                ? IconButton(
+                    icon: Icon(Icons.clear, size: 18, color: Colors.grey[500]),
+                    onPressed: () => setState(() => _selectedParentId = null),
+                  )
+                : null,
+          ),
+          isExpanded: true,
+          items: [
+            const DropdownMenuItem<int?>(
+              value: null,
+              child: Text('None (standalone)', style: TextStyle(color: Colors.grey)),
+            ),
+            ...possibleParents.map((t) {
+              final label = t.description.isNotEmpty
+                  ? t.description
+                  : 'Transaction #${t.id}';
+              final amountStr = CurrencyFormatter.format(t.amount);
+              return DropdownMenuItem<int?>(
+                value: t.id,
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        label,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(fontSize: 14),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Text(
+                      amountStr,
+                      style: TextStyle(
+                        fontSize: 12,
+                        color: Colors.grey[500],
+                      ),
+                    ),
+                  ],
+                ),
+              );
+            }),
+          ],
+          onChanged: (v) => setState(() => _selectedParentId = v),
+        ),
+        const SizedBox(height: 12),
+      ],
+    );
+  }
+
   Future<void> _pickDate() async {
     final picked = await showDatePicker(
       context: context,
@@ -342,6 +465,10 @@ class _AddTransactionDialogState extends State<AddTransactionDialog> {
     if (!_formKey.currentState!.validate()) return;
     if (_categoryId == null || _accountId == null) return;
 
+    final parentId = widget.isSubTransaction
+        ? widget.parentTransaction!.id
+        : _selectedParentId;
+
     final newTxn = MoneyTransaction(
       id: widget.existingTransaction?.id,
       amount: double.parse(_amountController.text),
@@ -352,12 +479,15 @@ class _AddTransactionDialogState extends State<AddTransactionDialog> {
       date: _date,
       source: widget.existingTransaction?.source ?? widget.source,
       createdAt: widget.existingTransaction?.createdAt,
+      parentId: parentId,
     );
 
     final txnProvider = context.read<TransactionProvider>();
 
     if (widget.isEditing) {
       txnProvider.updateTransaction(widget.existingTransaction!, newTxn);
+    } else if (parentId != null) {
+      txnProvider.addSubTransaction(newTxn, parentId);
     } else {
       txnProvider.addTransaction(newTxn);
     }

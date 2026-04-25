@@ -4,12 +4,13 @@ import 'package:another_telephony/telephony.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'sms_parser.dart';
+import 'sms_auto_saver.dart';
 
 typedef OnTransactionDetected = void Function(SmsParseResult result);
 
 class SmsDebugEntry {
   final DateTime time;
-  final String source; // 'broadcast', 'poll', 'test', 'info', 'error'
+  final String source; // 'broadcast', 'background', 'poll', 'test', 'info', 'error'
   final String message;
 
   SmsDebugEntry(this.source, this.message) : time = DateTime.now();
@@ -28,7 +29,12 @@ class SmsService {
   SmsService._internal();
 
   final Telephony _telephony = Telephony.instance;
+
+  /// Optional UI callback for live updates while the app is open.
+  /// The actual persistence happens in [SmsAutoSaver] regardless of this
+  /// callback, so the feature works even when the app is killed.
   OnTransactionDetected? onTransactionDetected;
+
   List<String> _activeKeywords = [];
   bool _isListening = false;
   Timer? _pollTimer;
@@ -49,7 +55,6 @@ class SmsService {
     final key = body.hashCode.toString();
     if (_recentlyProcessed.contains(key)) return true;
     _recentlyProcessed.add(key);
-    // Keep set bounded
     if (_recentlyProcessed.length > 30) {
       _recentlyProcessed.remove(_recentlyProcessed.first);
     }
@@ -66,17 +71,20 @@ class SmsService {
   }
 
   Future<bool> requestPermissions() async {
-    _log('info', 'Requesting SMS + Phone permissions...');
+    _log('info', 'Requesting SMS + Phone + Notification permissions...');
     final statuses = await [
       Permission.sms,
       Permission.phone,
+      Permission.notification,
     ].request();
 
     final smsGranted = statuses[Permission.sms]?.isGranted ?? false;
     final phoneGranted = statuses[Permission.phone]?.isGranted ?? false;
+    final notifGranted = statuses[Permission.notification]?.isGranted ?? false;
 
     _log('info', 'SMS permission: ${smsGranted ? "GRANTED" : "DENIED"}');
     _log('info', 'Phone permission: ${phoneGranted ? "GRANTED" : "DENIED"}');
+    _log('info', 'Notification permission: ${notifGranted ? "GRANTED" : "DENIED"}');
 
     return smsGranted;
   }
@@ -84,9 +92,11 @@ class SmsService {
   Future<Map<String, bool>> checkPermissionStatus() async {
     final sms = await Permission.sms.status;
     final phone = await Permission.phone.status;
+    final notification = await Permission.notification.status;
     return {
       'sms': sms.isGranted,
       'phone': phone.isGranted,
+      'notification': notification.isGranted,
     };
   }
 
@@ -100,14 +110,20 @@ class SmsService {
     _activeKeywords = keywords;
     _isListening = true;
 
-    // Primary: real-time broadcast listener
+    // Persist config so the background isolate can read it.
+    await _persistRuntimeConfig(keywords: keywords, enabled: true);
+
+    // Primary: real-time broadcast listener with BOTH foreground and
+    // background handlers. The background handler runs in a separate
+    // isolate when the app is killed.
     _telephony.listenIncomingSms(
       onNewMessage: _handleIncomingSms,
+      onBackgroundMessage: smsBackgroundMessageHandler,
       listenInBackground: true,
     );
-    _log('info', 'Broadcast listener registered');
+    _log('info', 'Broadcast listener registered (foreground + background)');
 
-    // Fallback: poll inbox every 15s
+    // Fallback: poll inbox every 15s while the app is alive.
     await _initLastTimestamp();
     _pollTimer?.cancel();
     _pollTimer = Timer.periodic(const Duration(seconds: 15), (_) {
@@ -115,6 +131,15 @@ class SmsService {
     });
     _log('info', 'Polling started (every 15s)');
     _log('info', 'Listening with ${keywords.length} keywords');
+  }
+
+  Future<void> _persistRuntimeConfig({
+    required List<String> keywords,
+    required bool enabled,
+  }) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(SmsAutoSaver.prefsKeyEnabled, enabled);
+    await prefs.setStringList(SmsAutoSaver.prefsKeyKeywords, keywords);
   }
 
   Future<void> _initLastTimestamp() async {
@@ -125,7 +150,7 @@ class SmsService {
   }
 
   Future<void> _pollInbox() async {
-    if (!_isListening || onTransactionDetected == null) return;
+    if (!_isListening) return;
 
     try {
       final messages = await _telephony.getInboxSms(
@@ -133,7 +158,6 @@ class SmsService {
         sortOrder: [OrderBy(SmsColumn.DATE, sort: Sort.DESC)],
       );
 
-      int newCount = 0;
       for (final msg in messages) {
         final msgDate = msg.date;
         if (msgDate == null || msgDate <= _lastProcessedTimestamp) break;
@@ -141,7 +165,6 @@ class SmsService {
         final body = msg.body;
         if (body == null || body.isEmpty) continue;
 
-        newCount++;
         final preview = body.substring(0, body.length > 60 ? 60 : body.length);
 
         if (_isDuplicate(body)) {
@@ -151,11 +174,20 @@ class SmsService {
 
         _log('poll', 'New SMS from ${msg.address ?? "?"}: $preview...');
 
-        final result = SmsParser.parse(body, _activeKeywords);
-        if (result.matched && onTransactionDetected != null) {
-          _log('poll', 'MATCHED! Amount: ${result.amount}, Type: ${result.type}');
-          onTransactionDetected!(result);
-        } else if (!result.matched) {
+        // Save through the same isolate-safe path used in background.
+        final saved = await SmsAutoSaver.handleIncomingSms(
+          body: body,
+          sender: msg.address,
+        );
+
+        if (saved) {
+          _log('poll', 'MATCHED + SAVED');
+          // Best-effort UI hint (only meaningful if app is alive).
+          final result = SmsParser.parse(body, _activeKeywords);
+          if (result.matched && onTransactionDetected != null) {
+            onTransactionDetected!(result);
+          }
+        } else {
           _log('poll', 'No match (no amount or keyword miss)');
         }
       }
@@ -165,16 +197,12 @@ class SmsService {
         final prefs = await SharedPreferences.getInstance();
         await prefs.setInt('last_sms_timestamp', _lastProcessedTimestamp);
       }
-
-      if (newCount == 0) {
-        // Silent - don't spam log with "no new messages"
-      }
     } catch (e) {
       _log('error', 'Poll failed: $e');
     }
   }
 
-  void _handleIncomingSms(SmsMessage message) {
+  Future<void> _handleIncomingSms(SmsMessage message) async {
     final body = message.body;
     if (body == null || body.isEmpty) return;
 
@@ -187,17 +215,25 @@ class SmsService {
     final msgDate = message.date;
     if (msgDate != null && msgDate > _lastProcessedTimestamp) {
       _lastProcessedTimestamp = msgDate;
-      SharedPreferences.getInstance().then((prefs) {
-        prefs.setInt('last_sms_timestamp', _lastProcessedTimestamp);
-      });
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setInt('last_sms_timestamp', _lastProcessedTimestamp);
     }
 
-    final result = SmsParser.parse(body, _activeKeywords);
-    if (result.matched && onTransactionDetected != null) {
-      _log('broadcast', 'MATCHED! Amount: ${result.amount}, Type: ${result.type}');
-      onTransactionDetected!(result);
+    // Always run the persistence path - works whether or not the UI exists.
+    final saved = await SmsAutoSaver.handleIncomingSms(
+      body: body,
+      sender: message.address,
+    );
+
+    if (saved) {
+      _log('broadcast', 'MATCHED + SAVED');
+      // Best-effort UI hint for any listening screens.
+      final result = SmsParser.parse(body, _activeKeywords);
+      if (result.matched && onTransactionDetected != null) {
+        onTransactionDetected!(result);
+      }
     } else {
-      _log('broadcast', 'No match (amount: ${result.amount}, matched: ${result.matched})');
+      _log('broadcast', 'No match or save skipped');
     }
   }
 
@@ -257,18 +293,19 @@ class SmsService {
     _pollTimer?.cancel();
     _pollTimer = null;
     _log('info', 'Listening stopped');
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setBool('sms_tracking_enabled', false);
+    await _persistRuntimeConfig(keywords: _activeKeywords, enabled: false);
   }
 
-  void updateKeywords(List<String> keywords) {
+  Future<void> updateKeywords(List<String> keywords) async {
     _activeKeywords = keywords;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setStringList(SmsAutoSaver.prefsKeyKeywords, keywords);
     _log('info', 'Keywords updated: ${keywords.length} active');
   }
 
   Future<void> restoreIfEnabled(List<String> keywords) async {
     final prefs = await SharedPreferences.getInstance();
-    final wasEnabled = prefs.getBool('sms_tracking_enabled') ?? false;
+    final wasEnabled = prefs.getBool(SmsAutoSaver.prefsKeyEnabled) ?? false;
     if (wasEnabled && keywords.isNotEmpty) {
       _log('info', 'Restoring SMS tracking from previous session');
       await startListening(keywords);
@@ -276,7 +313,26 @@ class SmsService {
   }
 }
 
+/// Top-level background handler invoked by the platform when an SMS arrives
+/// and the Flutter engine is NOT running (i.e. the app is killed).
+///
+/// MUST be a top-level / static function and annotated with
+/// `@pragma('vm:entry-point')` so the Dart compiler keeps it in tree-shaken
+/// release builds and the platform isolate can spawn it.
 @pragma('vm:entry-point')
-void backgroundMessageHandler(SmsMessage message) async {
-  // Background SMS processing handled by telephony package
+Future<void> smsBackgroundMessageHandler(SmsMessage message) async {
+  // Required: bind the background isolate's BinaryMessenger before touching
+  // any plugin (sqflite / shared_preferences / notifications).
+  // The telephony plugin already calls ensureInitialized in its background
+  // entry-point, but we call it here defensively in case that changes.
+  // ignore: avoid_print
+  print('SMS background handler invoked: ${message.address}');
+
+  final body = message.body;
+  if (body == null || body.isEmpty) return;
+
+  await SmsAutoSaver.handleIncomingSms(
+    body: body,
+    sender: message.address,
+  );
 }

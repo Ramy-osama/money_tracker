@@ -5,6 +5,9 @@ import '../models/account.dart';
 import '../models/category.dart';
 import '../models/budget.dart';
 import '../models/goal.dart';
+import '../models/group_order.dart';
+import '../models/group_participant.dart';
+import '../models/group_item.dart';
 import '../utils/constants.dart';
 
 class DbHelper {
@@ -26,7 +29,7 @@ class DbHelper {
 
     return await openDatabase(
       path,
-      version: 2,
+      version: 4,
       onCreate: _onCreate,
       onUpgrade: _onUpgrade,
     );
@@ -67,8 +70,10 @@ class DbHelper {
         source TEXT NOT NULL DEFAULT 'manual',
         created_at TEXT NOT NULL,
         needs_review INTEGER NOT NULL DEFAULT 0,
+        parent_id INTEGER,
         FOREIGN KEY (category_id) REFERENCES categories(id),
-        FOREIGN KEY (account_id) REFERENCES accounts(id)
+        FOREIGN KEY (account_id) REFERENCES accounts(id),
+        FOREIGN KEY (parent_id) REFERENCES transactions(id) ON DELETE CASCADE
       )
     ''');
 
@@ -103,13 +108,74 @@ class DbHelper {
       )
     ''');
 
+    await _createGroupTables(db);
+
     await _seedData(db);
+  }
+
+  Future<void> _createGroupTables(Database db) async {
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS group_orders (
+        id TEXT PRIMARY KEY,
+        title TEXT NOT NULL,
+        total_amount REAL NOT NULL,
+        payer_name TEXT NOT NULL,
+        payer_is_me INTEGER NOT NULL DEFAULT 1,
+        date TEXT NOT NULL,
+        account_id TEXT,
+        transaction_id TEXT,
+        shared_costs REAL NOT NULL DEFAULT 0,
+        is_settled INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL
+      )
+    ''');
+
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS group_items (
+        id TEXT PRIMARY KEY,
+        group_order_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        price REAL NOT NULL,
+        assigned_to TEXT,
+        FOREIGN KEY (group_order_id) REFERENCES group_orders(id) ON DELETE CASCADE
+      )
+    ''');
+
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS group_participants (
+        id TEXT PRIMARY KEY,
+        group_order_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        items_total REAL NOT NULL DEFAULT 0,
+        shared_cost_share REAL NOT NULL DEFAULT 0,
+        total_amount REAL NOT NULL DEFAULT 0,
+        is_paid INTEGER NOT NULL DEFAULT 0,
+        paid_date TEXT,
+        FOREIGN KEY (group_order_id) REFERENCES group_orders(id) ON DELETE CASCADE
+      )
+    ''');
+
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS saved_contacts (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL UNIQUE,
+        usage_count INTEGER NOT NULL DEFAULT 1,
+        last_used TEXT NOT NULL
+      )
+    ''');
   }
 
   Future<void> _onUpgrade(Database db, int oldVersion, int newVersion) async {
     if (oldVersion < 2) {
       await db.execute(
           'ALTER TABLE transactions ADD COLUMN needs_review INTEGER NOT NULL DEFAULT 0');
+    }
+    if (oldVersion < 3) {
+      await db.execute(
+          'ALTER TABLE transactions ADD COLUMN parent_id INTEGER REFERENCES transactions(id)');
+    }
+    if (oldVersion < 4) {
+      await _createGroupTables(db);
     }
   }
 
@@ -188,7 +254,7 @@ class DbHelper {
         - COALESCE(SUM(CASE WHEN type = 'expense' THEN amount ELSE 0 END), 0)
         AS balance
       FROM transactions
-      WHERE account_id = ?
+      WHERE account_id = ? AND parent_id IS NULL
     ''', [accountId]);
     return (result.first['balance'] as num?)?.toDouble() ?? 0.0;
   }
@@ -269,11 +335,20 @@ class DbHelper {
     final db = await database;
     final id = await db.insert('transactions', transaction.toMap());
 
-    final delta =
-        transaction.type == 'income' ? transaction.amount : -transaction.amount;
-    await updateAccountBalance(transaction.accountId, delta);
+    // Only affect balance for top-level transactions
+    if (transaction.parentId == null) {
+      final delta =
+          transaction.type == 'income' ? transaction.amount : -transaction.amount;
+      await updateAccountBalance(transaction.accountId, delta);
+    }
 
     return id;
+  }
+
+  /// Insert a sub-transaction (child) without affecting account balance.
+  Future<int> insertSubTransaction(MoneyTransaction transaction) async {
+    final db = await database;
+    return await db.insert('transactions', transaction.toMap());
   }
 
   Future<List<MoneyTransaction>> getTransactions({
@@ -343,10 +418,16 @@ class DbHelper {
   Future<int> deleteTransaction(MoneyTransaction transaction) async {
     final db = await database;
 
-    // Reverse the transaction's effect on balance
-    final delta =
-        transaction.type == 'income' ? -transaction.amount : transaction.amount;
-    await updateAccountBalance(transaction.accountId, delta);
+    // Only reverse balance for top-level transactions
+    if (transaction.parentId == null) {
+      final delta =
+          transaction.type == 'income' ? -transaction.amount : transaction.amount;
+      await updateAccountBalance(transaction.accountId, delta);
+    }
+
+    // Delete child transactions first
+    await db.delete('transactions',
+        where: 'parent_id = ?', whereArgs: [transaction.id]);
 
     return await db.delete('transactions',
         where: 'id = ?', whereArgs: [transaction.id]);
@@ -371,18 +452,55 @@ class DbHelper {
     );
   }
 
+  Future<List<MoneyTransaction>> getChildTransactions(int parentId) async {
+    final db = await database;
+    final maps = await db.query(
+      'transactions',
+      where: 'parent_id = ?',
+      whereArgs: [parentId],
+      orderBy: 'date ASC, created_at ASC',
+    );
+    return maps.map((m) => MoneyTransaction.fromMap(m)).toList();
+  }
+
+  Future<int> getChildCount(int transactionId) async {
+    final db = await database;
+    final result = await db.rawQuery(
+      'SELECT COUNT(*) as cnt FROM transactions WHERE parent_id = ?',
+      [transactionId],
+    );
+    return (result.first['cnt'] as int?) ?? 0;
+  }
+
+  Future<Map<int, int>> getChildCounts(List<int> parentIds) async {
+    if (parentIds.isEmpty) return {};
+    final db = await database;
+    final placeholders = parentIds.map((_) => '?').join(',');
+    final result = await db.rawQuery(
+      'SELECT parent_id, COUNT(*) as cnt FROM transactions '
+      'WHERE parent_id IN ($placeholders) GROUP BY parent_id',
+      parentIds,
+    );
+    final counts = <int, int>{};
+    for (final row in result) {
+      counts[row['parent_id'] as int] = (row['cnt'] as int?) ?? 0;
+    }
+    return counts;
+  }
+
   Future<Map<String, double>> getMonthSummary(int year, int month) async {
     final db = await database;
     final startDate = DateTime(year, month, 1);
     final endDate = DateTime(year, month + 1, 0, 23, 59, 59);
 
+    // Exclude child transactions (parent_id IS NULL) so sub-items don't double-count
     final incomeResult = await db.rawQuery(
-      'SELECT COALESCE(SUM(amount), 0) as total FROM transactions WHERE type = ? AND date >= ? AND date <= ?',
+      'SELECT COALESCE(SUM(amount), 0) as total FROM transactions WHERE type = ? AND date >= ? AND date <= ? AND parent_id IS NULL',
       ['income', startDate.toIso8601String(), endDate.toIso8601String()],
     );
 
     final expenseResult = await db.rawQuery(
-      'SELECT COALESCE(SUM(amount), 0) as total FROM transactions WHERE type = ? AND date >= ? AND date <= ?',
+      'SELECT COALESCE(SUM(amount), 0) as total FROM transactions WHERE type = ? AND date >= ? AND date <= ? AND parent_id IS NULL',
       ['expense', startDate.toIso8601String(), endDate.toIso8601String()],
     );
 
@@ -408,7 +526,7 @@ class DbHelper {
       SELECT c.id, c.name, c.icon_name, SUM(t.amount) as total
       FROM transactions t
       JOIN categories c ON t.category_id = c.id
-      WHERE t.type = ? AND t.date >= ? AND t.date <= ?
+      WHERE t.type = ? AND t.date >= ? AND t.date <= ? AND t.parent_id IS NULL
       GROUP BY c.id
       ORDER BY total DESC
     ''', [type, startDate.toIso8601String(), endDate.toIso8601String()]);
@@ -434,6 +552,7 @@ class DbHelper {
           WHERE t.category_id = b.category_id
           AND t.type = 'expense'
           AND t.date >= ? AND t.date <= ?
+          AND t.parent_id IS NULL
         ), 0) as spent
       FROM budgets b
       JOIN categories c ON b.category_id = c.id
@@ -468,7 +587,7 @@ class DbHelper {
       LEFT JOIN (
         SELECT category_id, SUM(amount) as spent
         FROM transactions
-        WHERE type = 'expense' AND date >= ? AND date <= ?
+        WHERE type = 'expense' AND date >= ? AND date <= ? AND parent_id IS NULL
         GROUP BY category_id
       ) spent_data ON b.category_id = spent_data.category_id
     ''', [startDate.toIso8601String(), endDate.toIso8601String()]);
@@ -525,6 +644,127 @@ class DbHelper {
     final db = await database;
     return await db.delete('sms_keywords',
         where: 'keyword = ?', whereArgs: [keyword]);
+  }
+
+  // ─── Group Order CRUD ───
+
+  Future<void> insertGroupOrder(GroupOrder order) async {
+    final db = await database;
+    await db.insert('group_orders', order.toMap());
+    for (final item in order.items) {
+      await db.insert('group_items', item.toMap());
+    }
+    for (final participant in order.participants) {
+      await db.insert('group_participants', participant.toMap());
+    }
+  }
+
+  Future<List<GroupOrder>> getGroupOrders({bool? settled}) async {
+    final db = await database;
+    String? where;
+    List<dynamic>? whereArgs;
+    if (settled != null) {
+      where = 'is_settled = ?';
+      whereArgs = [settled ? 1 : 0];
+    }
+    final orderMaps = await db.query(
+      'group_orders',
+      where: where,
+      whereArgs: whereArgs,
+      orderBy: 'date DESC, created_at DESC',
+    );
+
+    final orders = <GroupOrder>[];
+    for (final map in orderMaps) {
+      final orderId = map['id'] as String;
+      final participants = await _getParticipantsForOrder(db, orderId);
+      final items = await _getItemsForOrder(db, orderId);
+      orders.add(GroupOrder.fromMap(map, participants: participants, items: items));
+    }
+    return orders;
+  }
+
+  Future<List<GroupParticipant>> _getParticipantsForOrder(Database db, String orderId) async {
+    final maps = await db.query(
+      'group_participants',
+      where: 'group_order_id = ?',
+      whereArgs: [orderId],
+      orderBy: 'name ASC',
+    );
+    return maps.map((m) => GroupParticipant.fromMap(m)).toList();
+  }
+
+  Future<List<GroupItem>> _getItemsForOrder(Database db, String orderId) async {
+    final maps = await db.query(
+      'group_items',
+      where: 'group_order_id = ?',
+      whereArgs: [orderId],
+      orderBy: 'name ASC',
+    );
+    return maps.map((m) => GroupItem.fromMap(m)).toList();
+  }
+
+  Future<void> updateGroupOrder(GroupOrder order) async {
+    final db = await database;
+    await db.update('group_orders', order.toMap(),
+        where: 'id = ?', whereArgs: [order.id]);
+  }
+
+  Future<void> deleteGroupOrder(String orderId) async {
+    final db = await database;
+    await db.delete('group_items', where: 'group_order_id = ?', whereArgs: [orderId]);
+    await db.delete('group_participants', where: 'group_order_id = ?', whereArgs: [orderId]);
+    await db.delete('group_orders', where: 'id = ?', whereArgs: [orderId]);
+  }
+
+  Future<void> updateParticipant(GroupParticipant participant) async {
+    final db = await database;
+    await db.update('group_participants', participant.toMap(),
+        where: 'id = ?', whereArgs: [participant.id]);
+  }
+
+  Future<bool> areAllParticipantsPaid(String orderId) async {
+    final db = await database;
+    final result = await db.rawQuery(
+      'SELECT COUNT(*) as cnt FROM group_participants WHERE group_order_id = ? AND is_paid = 0',
+      [orderId],
+    );
+    return (result.first['cnt'] as int) == 0;
+  }
+
+  Future<void> markOrderSettled(String orderId, bool settled) async {
+    final db = await database;
+    await db.update('group_orders', {'is_settled': settled ? 1 : 0},
+        where: 'id = ?', whereArgs: [orderId]);
+  }
+
+  // ─── Saved Contacts ───
+
+  Future<List<String>> getSavedContacts() async {
+    final db = await database;
+    final maps = await db.query('saved_contacts',
+        orderBy: 'usage_count DESC, last_used DESC');
+    return maps.map((m) => m['name'] as String).toList();
+  }
+
+  Future<void> upsertSavedContact(String name, String contactId) async {
+    final db = await database;
+    final existing = await db.query('saved_contacts',
+        where: 'name = ?', whereArgs: [name]);
+
+    if (existing.isEmpty) {
+      await db.insert('saved_contacts', {
+        'id': contactId,
+        'name': name,
+        'usage_count': 1,
+        'last_used': DateTime.now().toIso8601String(),
+      });
+    } else {
+      await db.rawUpdate(
+        'UPDATE saved_contacts SET usage_count = usage_count + 1, last_used = ? WHERE name = ?',
+        [DateTime.now().toIso8601String(), name],
+      );
+    }
   }
 
   // ─── Export ───

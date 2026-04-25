@@ -23,6 +23,8 @@ dependencies:
   another_telephony: ^0.4.1
   sqflite_common_ffi_web: ^1.1.1
   flutter_local_notifications: ^21.0.0
+  google_generative_ai: ^0.4.6
+  image_picker: ^1.1.2
 
 dev_dependencies:
   flutter_test:

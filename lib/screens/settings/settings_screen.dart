@@ -78,6 +78,18 @@ class SettingsScreen extends StatelessWidget {
                 ),
               ),
 
+              // AI Features section
+              _buildSectionHeader('AI FEATURES'),
+              _buildSettingsTile(
+                icon: Icons.auto_awesome,
+                iconColor: Colors.deepPurple,
+                title: 'Gemini API Key',
+                subtitle: settings.isGeminiConfigured
+                    ? 'Configured — AI scanning enabled'
+                    : 'Not set — tap to configure',
+                onTap: () => _showApiKeyDialog(context, settings),
+              ),
+
               // Data section
               _buildSectionHeader('DATA'),
               _buildSettingsTile(
@@ -208,6 +220,64 @@ class SettingsScreen extends StatelessWidget {
         ),
       );
     }
+  }
+
+  void _showApiKeyDialog(BuildContext context, SettingsProvider settings) {
+    final controller = TextEditingController(text: settings.geminiApiKey);
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Gemini API Key'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              'Get a free API key from Google AI Studio to enable AI-powered screenshot scanning for group orders.',
+              style: TextStyle(color: Colors.grey[600], fontSize: 13),
+            ),
+            const SizedBox(height: 4),
+            Text(
+              'Free tier: 15 requests/minute',
+              style: TextStyle(color: Colors.grey[500], fontSize: 12),
+            ),
+            const SizedBox(height: 16),
+            TextField(
+              controller: controller,
+              decoration: const InputDecoration(
+                labelText: 'API Key',
+                hintText: 'Paste your Gemini API key',
+                border: OutlineInputBorder(),
+              ),
+              obscureText: true,
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Cancel'),
+          ),
+          ElevatedButton(
+            onPressed: () {
+              settings.setGeminiApiKey(controller.text);
+              Navigator.pop(ctx);
+              ScaffoldMessenger.of(context).showSnackBar(
+                SnackBar(
+                  content: Text(
+                    controller.text.trim().isEmpty
+                        ? 'API key cleared'
+                        : 'API key saved',
+                  ),
+                  behavior: SnackBarBehavior.floating,
+                ),
+              );
+            },
+            child: const Text('Save'),
+          ),
+        ],
+      ),
+    );
   }
 
   void _showAbout(BuildContext context) {

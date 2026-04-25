@@ -1,17 +1,15 @@
 import 'package:flutter/material.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:provider/provider.dart';
-import '../../models/category.dart';
 import '../../models/transaction_model.dart';
 import '../../providers/transaction_provider.dart';
 import '../../providers/account_provider.dart';
-import '../../services/notification_service.dart';
 import '../../services/speech_service.dart';
 import '../../services/sms_service.dart';
 import '../../services/sms_parser.dart';
 import '../../widgets/month_selector.dart';
 import '../../widgets/account_card.dart';
-import '../../widgets/transaction_tile.dart';
+import '../../widgets/transaction_group_tile.dart';
 import '../../utils/constants.dart';
 import '../../utils/currency_formatter.dart';
 import 'add_transaction_dialog.dart';
@@ -35,56 +33,21 @@ class _WalletScreenState extends State<WalletScreen> {
   }
 
   void _setupSmsListener() {
+    // The actual persistence is handled by SmsAutoSaver inside the SmsService
+    // (works whether the app is foreground, background, or killed).
+    // Here we only listen for live UI updates while this screen is mounted.
     final smsService = SmsService();
     smsService.onTransactionDetected = (SmsParseResult result) {
       if (!mounted) return;
-      _autoSaveSmsTransaction(result);
+      _refreshAfterSmsDetected();
     };
   }
 
-  Future<void> _autoSaveSmsTransaction(SmsParseResult result) async {
-    if (result.amount == null || result.amount! <= 0) return;
-
+  Future<void> _refreshAfterSmsDetected() async {
     final txnProvider = context.read<TransactionProvider>();
     final accountProvider = context.read<AccountProvider>();
-
-    final accounts = accountProvider.accounts;
-    if (accounts.isEmpty) return;
-
-    // Find a default category for the transaction type
-    final categories = txnProvider.categories;
-    final targetType = result.type;
-    final matchingCategories =
-        categories.where((Category c) => c.type == targetType).toList();
-    final categoryId = matchingCategories.isNotEmpty
-        ? matchingCategories.first.id!
-        : categories.first.id!;
-
-    final description = result.merchant ??
-        result.rawBody.substring(
-          0,
-          result.rawBody.length > 50 ? 50 : result.rawBody.length,
-        );
-
-    final transaction = MoneyTransaction(
-      amount: result.amount!,
-      type: targetType,
-      categoryId: categoryId,
-      accountId: accounts.first.id!,
-      description: description,
-      date: DateTime.now(),
-      source: 'sms',
-      needsReview: true,
-    );
-
-    await txnProvider.addTransaction(transaction);
+    await txnProvider.loadData();
     await accountProvider.loadAccounts();
-
-    NotificationService().showSmsTransactionNotification(
-      amount: result.amount!,
-      merchant: result.merchant,
-      type: targetType,
-    );
   }
 
   Future<void> _startVoiceInput() async {
@@ -384,11 +347,15 @@ class _WalletScreenState extends State<WalletScreen> {
         (context, index) {
           final txn = provider.transactions[index];
           final category = provider.getCategoryById(txn.categoryId);
-          return TransactionTile(
+          final childCount = txn.id != null ? provider.getChildCount(txn.id!) : 0;
+          return TransactionGroupTile(
             transaction: txn,
             category: category,
+            childCount: childCount,
             onTap: () => _showEditDialog(txn),
             onDelete: () => provider.deleteTransaction(txn),
+            onAddSubTransaction: (parent) => _showAddSubTransactionDialog(parent),
+            onBreakDown: (parent) => _showAddSubTransactionDialog(parent),
             onMarkReviewed: () async {
               await provider.markReviewed(txn);
               if (mounted) {
@@ -426,6 +393,16 @@ class _WalletScreenState extends State<WalletScreen> {
     showDialog(
       context: context,
       builder: (_) => AddTransactionDialog(existingTransaction: transaction),
+    );
+  }
+
+  void _showAddSubTransactionDialog(MoneyTransaction parent) {
+    showDialog(
+      context: context,
+      builder: (_) => AddTransactionDialog(
+        parentTransaction: parent,
+        source: 'manual',
+      ),
     );
   }
 

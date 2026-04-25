@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'screens/wallet/wallet_screen.dart';
 import 'screens/insights/insights_screen.dart';
 import 'screens/buckets/buckets_screen.dart';
+import 'screens/groups/groups_screen.dart';
 import 'screens/settings/settings_screen.dart';
 import 'utils/constants.dart';
 
@@ -68,6 +69,7 @@ class _MainNavigationState extends State<MainNavigation> {
   final _screens = const [
     WalletScreen(),
     BucketsScreen(),
+    GroupsScreen(),
     InsightsScreen(),
     SettingsScreen(),
   ];
@@ -106,6 +108,11 @@ class _MainNavigationState extends State<MainNavigation> {
               icon: Icon(Icons.shopping_basket_outlined),
               selectedIcon: Icon(Icons.shopping_basket, color: AppColors.primary),
               label: 'Buckets',
+            ),
+            NavigationDestination(
+              icon: Icon(Icons.group_outlined),
+              selectedIcon: Icon(Icons.group, color: AppColors.primary),
+              label: 'Groups',
             ),
             NavigationDestination(
               icon: Icon(Icons.bar_chart_outlined),

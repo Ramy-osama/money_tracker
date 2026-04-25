@@ -53,7 +53,7 @@ class DefaultSmsKeywords {
   static const List<String> keywords = [
     // Bank names (Egypt)
     'EGBANK', 'CIB', 'NBE', 'QNB', 'HSBC', 'Banque Misr',
-    'Faisal', 'AAIB', 'Alex Bank', 'BDC',
+    'Faisal', 'AAIB', 'Alex Bank', 'BDC', 'AlAhly', 'الأهلي',
     // English transaction words
     'transaction', 'purchase', 'payment', 'debit', 'credit',
     'spent', 'balance', 'withdraw', 'deposit', 'transfer',
@@ -62,6 +62,7 @@ class DefaultSmsKeywords {
     // Arabic transaction words
     'عملية', 'شراء', 'دفع', 'خصم', 'إضافة',
     'رصيد', 'سحب', 'إيداع', 'تحويل', 'حسابك', 'بنك', 'جنيه',
+    'تم خصم', 'تم إضافة', 'جم', 'بطاقة',
   ];
 }
 

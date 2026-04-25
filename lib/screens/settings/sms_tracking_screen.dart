@@ -1,6 +1,9 @@
 import 'package:flutter/material.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:provider/provider.dart';
+import '../../models/account.dart';
+import '../../models/category.dart';
+import '../../providers/account_provider.dart';
 import '../../providers/settings_provider.dart';
 import '../../services/sms_service.dart';
 import '../../utils/constants.dart';
@@ -69,6 +72,7 @@ class _SmsTrackingScreenState extends State<SmsTrackingScreen> {
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             _buildToggleCard(settings),
+            _buildTargetCard(settings),
             _buildKeywordsCard(settings),
             if (_showDebug) ...[
               _buildDebugPanel(),
@@ -140,6 +144,120 @@ class _SmsTrackingScreenState extends State<SmsTrackingScreen> {
           const SizedBox(height: 12),
           _buildInfoRow(Icons.battery_charging_full,
               'Samsung: Go to Settings > Apps > Money Tracker > Battery > Unrestricted to prevent background kill.'),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildTargetCard(SettingsProvider settings) {
+    final accountProvider = context.watch<AccountProvider>();
+    final accounts = accountProvider.accounts;
+    final expenseCategories =
+        settings.categories.where((c) => c.type == 'expense').toList();
+    final incomeCategories =
+        settings.categories.where((c) => c.type == 'income').toList();
+
+    return Container(
+      margin: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(16),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text(
+            'Auto-Save Target',
+            style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+          ),
+          const SizedBox(height: 4),
+          Text(
+            'Where SMS-detected transactions should be saved (used by the '
+            'background handler when the app is closed)',
+            style: TextStyle(color: Colors.grey[600], fontSize: 13),
+          ),
+          const SizedBox(height: 16),
+          if (accounts.isEmpty)
+            const Text(
+              'No accounts yet. Add an account first.',
+              style: TextStyle(color: Colors.redAccent),
+            )
+          else
+            DropdownButtonFormField<int?>(
+              value: settings.smsTargetAccountId != null &&
+                      accounts.any((a) => a.id == settings.smsTargetAccountId)
+                  ? settings.smsTargetAccountId
+                  : null,
+              decoration: const InputDecoration(
+                labelText: 'Account',
+                prefixIcon: Icon(Icons.account_balance_wallet_outlined),
+              ),
+              items: <DropdownMenuItem<int?>>[
+                const DropdownMenuItem<int?>(
+                  value: null,
+                  child: Text('First account (default)'),
+                ),
+                ...accounts.map(
+                  (Account a) => DropdownMenuItem<int?>(
+                    value: a.id,
+                    child: Text(a.name),
+                  ),
+                ),
+              ],
+              onChanged: (value) => settings.setSmsTargetAccount(value),
+            ),
+          const SizedBox(height: 12),
+          DropdownButtonFormField<int?>(
+            value: settings.smsTargetExpenseCategoryId != null &&
+                    expenseCategories
+                        .any((c) => c.id == settings.smsTargetExpenseCategoryId)
+                ? settings.smsTargetExpenseCategoryId
+                : null,
+            decoration: const InputDecoration(
+              labelText: 'Expense category',
+              prefixIcon: Icon(Icons.shopping_cart_outlined),
+            ),
+            items: <DropdownMenuItem<int?>>[
+              const DropdownMenuItem<int?>(
+                value: null,
+                child: Text('First expense category (default)'),
+              ),
+              ...expenseCategories.map(
+                (Category c) => DropdownMenuItem<int?>(
+                  value: c.id,
+                  child: Text(c.name),
+                ),
+              ),
+            ],
+            onChanged: (value) =>
+                settings.setSmsTargetExpenseCategory(value),
+          ),
+          const SizedBox(height: 12),
+          DropdownButtonFormField<int?>(
+            value: settings.smsTargetIncomeCategoryId != null &&
+                    incomeCategories
+                        .any((c) => c.id == settings.smsTargetIncomeCategoryId)
+                ? settings.smsTargetIncomeCategoryId
+                : null,
+            decoration: const InputDecoration(
+              labelText: 'Income category',
+              prefixIcon: Icon(Icons.attach_money),
+            ),
+            items: <DropdownMenuItem<int?>>[
+              const DropdownMenuItem<int?>(
+                value: null,
+                child: Text('First income category (default)'),
+              ),
+              ...incomeCategories.map(
+                (Category c) => DropdownMenuItem<int?>(
+                  value: c.id,
+                  child: Text(c.name),
+                ),
+              ),
+            ],
+            onChanged: (value) => settings.setSmsTargetIncomeCategory(value),
+          ),
         ],
       ),
     );

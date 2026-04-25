@@ -1,11 +1,30 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- SMS Auto-Tracking -->
     <uses-permission android:name="android.permission.READ_SMS"/>
     <uses-permission android:name="android.permission.RECEIVE_SMS"/>
-    <uses-permission android:name="android.permission.RECORD_AUDIO"/>
     <uses-permission android:name="android.permission.READ_PHONE_STATE"/>
+
+    <!-- Keep the device awake long enough to process an incoming SMS in the
+         background isolate even when the app process is otherwise idle. -->
+    <uses-permission android:name="android.permission.WAKE_LOCK"/>
+
+    <!-- Re-arm any internal scheduling after device reboot. The
+         IncomingSmsReceiver is automatically re-registered by Android because
+         SMS_RECEIVED is a protected broadcast, but this permission lets us
+         react to BOOT_COMPLETED if we ever add a startup task. -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"/>
+
+    <!-- Voice input -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO"/>
+
+    <!-- File export -->
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"/>
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"/>
+
+    <!-- Networking (Gemini receipt scanning) -->
     <uses-permission android:name="android.permission.INTERNET"/>
+
+    <!-- User-visible notifications when an SMS transaction is auto-saved -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
 
     <application
@@ -34,10 +53,18 @@
             android:name="flutterEmbedding"
             android:value="2" />
 
+        <!--
+          IncomingSmsReceiver from the another_telephony package.
+          Android wakes this receiver up via the SMS_RECEIVED broadcast even
+          if the app process is killed - it will spawn a new Flutter
+          background isolate and invoke the @pragma('vm:entry-point') handler
+          we registered in `lib/services/sms_service.dart`
+          (smsBackgroundMessageHandler).
+        -->
         <receiver android:name="com.shounakmulay.telephony.sms.IncomingSmsReceiver"
             android:permission="android.permission.BROADCAST_SMS"
             android:exported="true">
-            <intent-filter>
+            <intent-filter android:priority="999">
                 <action android:name="android.provider.Telephony.SMS_RECEIVED"/>
             </intent-filter>
         </receiver>
