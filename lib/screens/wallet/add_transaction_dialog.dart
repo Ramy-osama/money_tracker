@@ -7,6 +7,7 @@ import '../../providers/transaction_provider.dart';
 import '../../providers/account_provider.dart';
 import '../../utils/constants.dart';
 import '../../utils/currency_formatter.dart';
+import '../../widgets/delete_with_undo.dart';
 
 class AddTransactionDialog extends StatefulWidget {
   final double? prefillAmount;
@@ -510,8 +511,10 @@ class _AddTransactionDialogState extends State<AddTransactionDialog> {
           ),
           TextButton(
             onPressed: () {
-              context.read<TransactionProvider>().deleteTransaction(widget.existingTransaction!);
-              context.read<AccountProvider>().loadAccounts();
+              deleteTransactionsWithUndo(
+                context,
+                [widget.existingTransaction!.id!],
+              );
               Navigator.pop(ctx);
               Navigator.pop(context);
             },

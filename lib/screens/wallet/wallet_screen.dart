@@ -10,10 +10,12 @@ import '../../services/sms_parser.dart';
 import '../../widgets/month_selector.dart';
 import '../../widgets/account_card.dart';
 import '../../widgets/transaction_group_tile.dart';
+import '../../widgets/delete_with_undo.dart';
 import '../../utils/constants.dart';
 import '../../utils/currency_formatter.dart';
 import 'add_transaction_dialog.dart';
 import 'multi_transaction_dialog.dart';
+import 'review_duplicates_screen.dart';
 
 class WalletScreen extends StatefulWidget {
   const WalletScreen({super.key});
@@ -46,7 +48,7 @@ class _WalletScreenState extends State<WalletScreen> {
   Future<void> _refreshAfterSmsDetected() async {
     final txnProvider = context.read<TransactionProvider>();
     final accountProvider = context.read<AccountProvider>();
-    await txnProvider.loadData();
+    await txnProvider.refresh();
     await accountProvider.loadAccounts();
   }
 
@@ -245,14 +247,28 @@ class _WalletScreenState extends State<WalletScreen> {
           children: [
             Row(
               children: [
-                const Text(
-                  'Recent Transactions',
-                  style: TextStyle(
-                    fontSize: 18,
-                    fontWeight: FontWeight.bold,
+                const Expanded(
+                  child: Align(
+                    alignment: Alignment.centerLeft,
+                    child: FittedBox(
+                      fit: BoxFit.scaleDown,
+                      child: Text(
+                        'Recent Transactions',
+                        style: TextStyle(
+                          fontSize: 18,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                    ),
                   ),
                 ),
-                const Spacer(),
+                IconButton(
+                  onPressed: _openDuplicateReview,
+                  icon: const Icon(Icons.copy_all_outlined, size: 20),
+                  tooltip: 'Review duplicates',
+                  color: AppColors.primary,
+                  visualDensity: VisualDensity.compact,
+                ),
                 TextButton.icon(
                   onPressed: () => _showAddDialog(),
                   icon: const Icon(Icons.add_circle_outline, size: 18),
@@ -349,11 +365,12 @@ class _WalletScreenState extends State<WalletScreen> {
           final category = provider.getCategoryById(txn.categoryId);
           final childCount = txn.id != null ? provider.getChildCount(txn.id!) : 0;
           return TransactionGroupTile(
+            key: ValueKey(txn.id),
             transaction: txn,
             category: category,
             childCount: childCount,
             onTap: () => _showEditDialog(txn),
-            onDelete: () => provider.deleteTransaction(txn),
+            onDelete: () => deleteTransactionsWithUndo(context, [txn.id!]),
             onAddSubTransaction: (parent) => _showAddSubTransactionDialog(parent),
             onBreakDown: (parent) => _showAddSubTransactionDialog(parent),
             onMarkReviewed: () async {
@@ -378,7 +395,19 @@ class _WalletScreenState extends State<WalletScreen> {
           );
         },
         childCount: provider.transactions.length,
+        findChildIndexCallback: (key) {
+          final id = (key as ValueKey<int?>).value;
+          final index = provider.transactions.indexWhere((t) => t.id == id);
+          return index < 0 ? null : index;
+        },
       ),
+    );
+  }
+
+  void _openDuplicateReview() {
+    Navigator.push(
+      context,
+      MaterialPageRoute(builder: (_) => const ReviewDuplicatesScreen()),
     );
   }
 

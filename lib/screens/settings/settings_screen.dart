@@ -5,6 +5,7 @@ import '../../utils/constants.dart';
 import 'sms_tracking_screen.dart';
 import 'manage_categories_screen.dart';
 import 'manage_accounts_screen.dart';
+import '../wallet/review_duplicates_screen.dart';
 
 class SettingsScreen extends StatelessWidget {
   const SettingsScreen({super.key});
@@ -98,6 +99,18 @@ class SettingsScreen extends StatelessWidget {
                 title: 'Export Data',
                 subtitle: 'Export transactions as CSV',
                 onTap: () => _exportData(context, settings),
+              ),
+              _buildSettingsTile(
+                icon: Icons.copy_all,
+                iconColor: Colors.deepOrange,
+                title: 'Review Duplicates',
+                subtitle: 'Same title & amount within a minute',
+                onTap: () => Navigator.push(
+                  context,
+                  MaterialPageRoute(
+                    builder: (_) => const ReviewDuplicatesScreen(),
+                  ),
+                ),
               ),
 
               // About section

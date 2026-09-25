@@ -2,6 +2,7 @@ import 'package:flutter/foundation.dart' hide Category;
 import '../database/db_helper.dart';
 import '../models/transaction_model.dart';
 import '../models/category.dart';
+import '../services/duplicate_detector.dart';
 
 class TransactionProvider with ChangeNotifier {
   final DbHelper _db = DbHelper();
@@ -29,14 +30,25 @@ class TransactionProvider with ChangeNotifier {
     _isLoading = true;
     notifyListeners();
 
+    await _fetchAll();
+
+    _isLoading = false;
+    notifyListeners();
+  }
+
+  /// Re-reads the current month without entering the loading state, so the
+  /// wallet list stays mounted and keeps its scroll position.
+  Future<void> refresh() async {
+    await _fetchAll();
+    notifyListeners();
+  }
+
+  Future<void> _fetchAll() async {
     await Future.wait([
       _loadTransactions(),
       _loadSummary(),
       _loadCategories(),
     ]);
-
-    _isLoading = false;
-    notifyListeners();
   }
 
   Future<void> _loadTransactions() async {
@@ -89,7 +101,7 @@ class TransactionProvider with ChangeNotifier {
   Future<void> addSubTransaction(MoneyTransaction child, int parentId) async {
     final subTxn = child.copyWith(parentId: parentId);
     await _db.insertSubTransaction(subTxn);
-    await loadData();
+    await refresh();
   }
 
   void setSelectedMonth(DateTime month) {
@@ -115,29 +127,64 @@ class TransactionProvider with ChangeNotifier {
 
   Future<void> addTransaction(MoneyTransaction transaction) async {
     await _db.insertTransaction(transaction);
-    await loadData();
+    await refresh();
   }
 
-  Future<void> deleteTransaction(MoneyTransaction transaction) async {
-    await _db.deleteTransaction(transaction);
-    await loadData();
+  /// Deletes the transactions with [ids] together with their sub-items, and
+  /// returns every removed row so [restoreTransactions] can undo it.
+  Future<List<MoneyTransaction>> deleteTransactions(Iterable<int> ids) async {
+    final idSet = ids.toSet();
+    // Must happen before the first await: a swiped Dismissible has to leave
+    // the tree on the very next frame.
+    _transactions = _transactions.where((t) => !idSet.contains(t.id)).toList();
+    notifyListeners();
+
+    final removed = <MoneyTransaction>[];
+    for (final id in idSet) {
+      final txn = await _db.getTransactionById(id);
+      if (txn == null) continue;
+      removed.add(txn);
+      if (txn.parentId == null) {
+        removed.addAll(await _db.getChildTransactions(id));
+      }
+      await _db.deleteTransaction(txn);
+    }
+    await refresh();
+    return removed;
+  }
+
+  Future<void> restoreTransactions(List<MoneyTransaction> rows) async {
+    await _db.restoreTransactions(rows);
+    await refresh();
+  }
+
+  /// Suspected duplicates across all months (see [DuplicateDetector]), plus
+  /// the sub-item count of each transaction in them.
+  Future<({List<List<MoneyTransaction>> groups, Map<int, int> childCounts})>
+      findSuspectedDuplicates() async {
+    final groups = DuplicateDetector.findGroups(await _db.getTransactions());
+    final ids = [
+      for (final group in groups)
+        for (final t in group) t.id!,
+    ];
+    return (groups: groups, childCounts: await _db.getChildCounts(ids));
   }
 
   Future<void> updateTransaction(
       MoneyTransaction oldTxn, MoneyTransaction newTxn) async {
     await _db.updateTransaction(oldTxn, newTxn);
-    await loadData();
+    await refresh();
   }
 
   Future<void> markReviewed(MoneyTransaction txn) async {
     if (txn.id == null) return;
     await _db.markTransactionReviewed(txn.id!);
-    await loadData();
+    await refresh();
   }
 
   Future<void> markAllReviewed() async {
     await _db.markAllReviewed();
-    await loadData();
+    await refresh();
   }
 
   int get unreviewedCount =>

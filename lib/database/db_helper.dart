@@ -433,6 +433,25 @@ class DbHelper {
         where: 'id = ?', whereArgs: [transaction.id]);
   }
 
+  /// Re-inserts rows removed by [deleteTransaction] under their original ids,
+  /// so SMS-log and group-order links to them stay valid, and re-applies their
+  /// effect on account balances.
+  Future<void> restoreTransactions(List<MoneyTransaction> rows) async {
+    final db = await database;
+    await db.transaction((txn) async {
+      for (final t in rows) {
+        await txn.insert('transactions', t.toMap());
+        if (t.parentId == null || t.affectsTotal) {
+          final delta = t.type == 'income' ? t.amount : -t.amount;
+          await txn.rawUpdate(
+            'UPDATE accounts SET balance = balance + ? WHERE id = ?',
+            [delta, t.accountId],
+          );
+        }
+      }
+    });
+  }
+
   Future<int> markTransactionReviewed(int id) async {
     final db = await database;
     return await db.update(
