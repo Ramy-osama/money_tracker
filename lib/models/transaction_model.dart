@@ -10,6 +10,8 @@ class MoneyTransaction {
   final DateTime createdAt;
   final bool needsReview;
   final int? parentId;
+  final bool affectsParent;
+  final bool affectsTotal;
 
   MoneyTransaction({
     this.id,
@@ -23,6 +25,8 @@ class MoneyTransaction {
     DateTime? createdAt,
     this.needsReview = false,
     this.parentId,
+    this.affectsParent = false,
+    this.affectsTotal = false,
   }) : createdAt = createdAt ?? DateTime.now();
 
   bool get isChild => parentId != null;
@@ -40,6 +44,8 @@ class MoneyTransaction {
       'created_at': createdAt.toIso8601String(),
       'needs_review': needsReview ? 1 : 0,
       'parent_id': parentId,
+      'affects_parent': affectsParent ? 1 : 0,
+      'affects_total': affectsTotal ? 1 : 0,
     };
   }
 
@@ -56,6 +62,8 @@ class MoneyTransaction {
       createdAt: DateTime.parse(map['created_at'] as String),
       needsReview: (map['needs_review'] as int?) == 1,
       parentId: map['parent_id'] as int?,
+      affectsParent: (map['affects_parent'] as int?) == 1,
+      affectsTotal: (map['affects_total'] as int?) == 1,
     );
   }
 
@@ -70,6 +78,8 @@ class MoneyTransaction {
     String? source,
     bool? needsReview,
     int? parentId,
+    bool? affectsParent,
+    bool? affectsTotal,
     bool clearParentId = false,
   }) {
     return MoneyTransaction(
@@ -84,6 +94,8 @@ class MoneyTransaction {
       createdAt: createdAt,
       needsReview: needsReview ?? this.needsReview,
       parentId: clearParentId ? null : (parentId ?? this.parentId),
+      affectsParent: affectsParent ?? this.affectsParent,
+      affectsTotal: affectsTotal ?? this.affectsTotal,
     );
   }
 }

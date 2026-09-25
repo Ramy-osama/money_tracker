@@ -44,6 +44,11 @@ class _AddTransactionDialogState extends State<AddTransactionDialog> {
   int? _accountId;
   int? _selectedParentId;
   DateTime _date = DateTime.now();
+  bool _affectsParent = false;
+  bool _affectsTotal = false;
+
+  bool get _showAffectSwitches =>
+      widget.parentTransaction != null || _selectedParentId != null;
 
   @override
   void initState() {
@@ -58,11 +63,20 @@ class _AddTransactionDialogState extends State<AddTransactionDialog> {
       _accountId = txn.accountId;
       _selectedParentId = txn.parentId;
       _date = txn.date;
+      if (txn.parentId != null) {
+        _affectsParent = txn.affectsParent;
+        _affectsTotal = txn.affectsTotal;
+      }
     } else if (widget.isSubTransaction) {
       final parent = widget.parentTransaction!;
-      _type = parent.type;
+      // Default to OPPOSITE type so the common "settle/pay back" flow is one tap.
+      // The user can still toggle the type with the expense/income switch.
+      _type = parent.type == 'expense' ? 'income' : 'expense';
       _accountId = parent.accountId;
-      _date = parent.date;
+      _date = DateTime.now();
+      // Opposite-type children are payments toward the parent → mark affects_parent
+      // by default so the running "remaining" updates without an extra tap.
+      _affectsParent = true;
     } else {
       if (widget.prefillAmount != null) {
         _amountController.text = widget.prefillAmount!.toStringAsFixed(2);
@@ -127,7 +141,9 @@ class _AddTransactionDialogState extends State<AddTransactionDialog> {
                     Expanded(
                       child: Text(
                         widget.isEditing
-                            ? 'Edit Transaction'
+                            ? (widget.existingTransaction?.parentId != null
+                                ? 'Edit Sub-Transaction'
+                                : 'Edit Transaction')
                             : widget.isSubTransaction
                                 ? 'Add Sub-Transaction'
                                 : 'Add Transaction',
@@ -254,6 +270,23 @@ class _AddTransactionDialogState extends State<AddTransactionDialog> {
                 if (!widget.isSubTransaction)
                   _buildParentPicker(txnProvider),
 
+                if (_showAffectSwitches) ...[
+                  SwitchListTile(
+                    contentPadding: EdgeInsets.zero,
+                    title: const Text('Affects parent amount'),
+                    subtitle: const Text('Adjusts the displayed parent total'),
+                    value: _affectsParent,
+                    onChanged: (v) => setState(() => _affectsParent = v),
+                  ),
+                  SwitchListTile(
+                    contentPadding: EdgeInsets.zero,
+                    title: const Text('Affects total money'),
+                    subtitle: const Text('Counts toward your account balance and monthly totals'),
+                    value: _affectsTotal,
+                    onChanged: (v) => setState(() => _affectsTotal = v),
+                  ),
+                ],
+
                 ListTile(
                   contentPadding: EdgeInsets.zero,
                   leading: const Icon(Icons.calendar_today),
@@ -320,6 +353,31 @@ class _AddTransactionDialogState extends State<AddTransactionDialog> {
     );
   }
 
+  /// Resolve the parent (from explicit widget arg or selected dropdown) for the
+  /// purpose of recomputing affects_parent default when type toggles.
+  MoneyTransaction? _resolveSelectedParent() {
+    if (widget.parentTransaction != null) return widget.parentTransaction;
+    if (_selectedParentId == null) return null;
+    final txns = context.read<TransactionProvider>().transactions;
+    for (final t in txns) {
+      if (t.id == _selectedParentId) return t;
+    }
+    return null;
+  }
+
+  void _onTypeChanged(String newType) {
+    setState(() {
+      _type = newType;
+      _categoryId = null;
+      final parent = _resolveSelectedParent();
+      if (parent != null && !widget.isEditing) {
+        // Opposite-type child → likely a settlement, default affects_parent on.
+        // Same-type child → likely a breakdown line, default affects_parent off.
+        _affectsParent = parent.type != newType;
+      }
+    });
+  }
+
   Widget _buildTypeToggle() {
     return Container(
       decoration: BoxDecoration(
@@ -330,10 +388,7 @@ class _AddTransactionDialogState extends State<AddTransactionDialog> {
         children: [
           Expanded(
             child: GestureDetector(
-              onTap: () => setState(() {
-                _type = 'expense';
-                _categoryId = null;
-              }),
+              onTap: () => _onTypeChanged('expense'),
               child: Container(
                 padding: const EdgeInsets.symmetric(vertical: 12),
                 decoration: BoxDecoration(
@@ -354,10 +409,7 @@ class _AddTransactionDialogState extends State<AddTransactionDialog> {
           ),
           Expanded(
             child: GestureDetector(
-              onTap: () => setState(() {
-                _type = 'income';
-                _categoryId = null;
-              }),
+              onTap: () => _onTypeChanged('income'),
               child: Container(
                 padding: const EdgeInsets.symmetric(vertical: 12),
                 decoration: BoxDecoration(
@@ -382,11 +434,11 @@ class _AddTransactionDialogState extends State<AddTransactionDialog> {
   }
 
   Widget _buildParentPicker(TransactionProvider txnProvider) {
-    // Show top-level transactions of the same type as possible parents
-    // Exclude the current transaction when editing to prevent self-reference
+    // Show all top-level transactions as possible parents (any type).
+    // Mixed-type parent/child supports the "money owed" / "money to distribute" use case.
+    // Exclude the current transaction when editing to prevent self-reference.
     final possibleParents = txnProvider.transactions.where((t) {
       if (t.parentId != null) return false;
-      if (t.type != _type) return false;
       if (widget.isEditing && t.id == widget.existingTransaction!.id) return false;
       return true;
     }).toList();
@@ -397,6 +449,10 @@ class _AddTransactionDialogState extends State<AddTransactionDialog> {
           value: _selectedParentId,
           decoration: InputDecoration(
             labelText: 'Parent Transaction (optional)',
+            helperText: _selectedParentId != null
+                ? _parentChildHelperText(txnProvider)
+                : 'Group under a parent (e.g. payment + payback)',
+            helperMaxLines: 2,
             border: OutlineInputBorder(
               borderRadius: BorderRadius.circular(12),
             ),
@@ -420,10 +476,19 @@ class _AddTransactionDialogState extends State<AddTransactionDialog> {
                   ? t.description
                   : 'Transaction #${t.id}';
               final amountStr = CurrencyFormatter.format(t.amount);
+              final isExpense = t.type == 'expense';
               return DropdownMenuItem<int?>(
                 value: t.id,
                 child: Row(
                   children: [
+                    Icon(
+                      isExpense
+                          ? Icons.arrow_upward
+                          : Icons.arrow_downward,
+                      size: 14,
+                      color: isExpense ? AppColors.expense : AppColors.income,
+                    ),
+                    const SizedBox(width: 6),
                     Expanded(
                       child: Text(
                         label,
@@ -445,11 +510,59 @@ class _AddTransactionDialogState extends State<AddTransactionDialog> {
               );
             }),
           ],
-          onChanged: (v) => setState(() => _selectedParentId = v),
+          onChanged: _onParentChanged,
         ),
         const SizedBox(height: 12),
       ],
     );
+  }
+
+  /// Helper text shown under the parent picker once a parent is chosen.
+  /// Communicates the implied scenario (settle a payment vs. additional charge).
+  String _parentChildHelperText(TransactionProvider txnProvider) {
+    if (_selectedParentId == null) return '';
+    MoneyTransaction? parent;
+    for (final t in txnProvider.transactions) {
+      if (t.id == _selectedParentId) {
+        parent = t;
+        break;
+      }
+    }
+    if (parent == null) return '';
+    if (parent.type == _type) {
+      return 'Same-type sub-item (e.g. break down a bill into parts)';
+    }
+    return parent.type == 'expense'
+        ? 'Income under expense → tracks money paid back to you'
+        : 'Expense under income → tracks money distributed out';
+  }
+
+  /// Picking a parent of opposite type is the "owed/distribute" scenario:
+  /// auto-enable affects_parent so the running balance updates immediately.
+  void _onParentChanged(int? newParentId) {
+    if (newParentId == null) {
+      setState(() {
+        _selectedParentId = null;
+        _affectsParent = false;
+      });
+      return;
+    }
+
+    final txnProvider = context.read<TransactionProvider>();
+    MoneyTransaction? parent;
+    for (final t in txnProvider.transactions) {
+      if (t.id == newParentId) {
+        parent = t;
+        break;
+      }
+    }
+
+    setState(() {
+      _selectedParentId = newParentId;
+      if (parent != null && parent.type != _type) {
+        _affectsParent = true;
+      }
+    });
   }
 
   Future<void> _pickDate() async {
@@ -480,7 +593,10 @@ class _AddTransactionDialogState extends State<AddTransactionDialog> {
       date: _date,
       source: widget.existingTransaction?.source ?? widget.source,
       createdAt: widget.existingTransaction?.createdAt,
+      needsReview: widget.existingTransaction?.needsReview ?? false,
       parentId: parentId,
+      affectsParent: _showAffectSwitches ? _affectsParent : false,
+      affectsTotal: _showAffectSwitches ? _affectsTotal : false,
     );
 
     final txnProvider = context.read<TransactionProvider>();

@@ -7,6 +7,7 @@ import '../../providers/account_provider.dart';
 import '../../providers/settings_provider.dart';
 import '../../services/sms_service.dart';
 import '../../utils/constants.dart';
+import 'sms_inbox_log_screen.dart';
 
 class SmsTrackingScreen extends StatefulWidget {
   const SmsTrackingScreen({super.key});
@@ -17,6 +18,7 @@ class SmsTrackingScreen extends StatefulWidget {
 
 class _SmsTrackingScreenState extends State<SmsTrackingScreen> {
   final _keywordController = TextEditingController();
+  final _blockedSenderController = TextEditingController();
   final _smsService = SmsService();
   bool _showDebug = false;
   bool _scanning = false;
@@ -34,6 +36,7 @@ class _SmsTrackingScreenState extends State<SmsTrackingScreen> {
   void dispose() {
     _smsService.onDebugLogChanged = null;
     _keywordController.dispose();
+    _blockedSenderController.dispose();
     super.dispose();
   }
 
@@ -74,6 +77,8 @@ class _SmsTrackingScreenState extends State<SmsTrackingScreen> {
             _buildToggleCard(settings),
             _buildTargetCard(settings),
             _buildKeywordsCard(settings),
+            _buildBlockedSendersCard(settings),
+            _buildRecentSmsCard(),
             if (_showDebug) ...[
               _buildDebugPanel(),
               _buildScanResultsCard(),
@@ -318,6 +323,139 @@ class _SmsTrackingScreenState extends State<SmsTrackingScreen> {
                     borderRadius: BorderRadius.circular(20)),
               ),
             ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildBlockedSendersCard(SettingsProvider settings) {
+    return Container(
+      margin: const EdgeInsets.fromLTRB(16, 16, 16, 0),
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(16),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text('Blocked senders (${settings.blockedSenders.length})',
+              style:
+                  const TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+          const SizedBox(height: 4),
+          Text(
+            'Messages from these numbers or names are never auto-tracked',
+            style: TextStyle(color: Colors.grey[600], fontSize: 13),
+          ),
+          const SizedBox(height: 16),
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: [
+              ...settings.blockedSenders.map(
+                (s) => Chip(
+                  label: Text(s),
+                  deleteIcon: const Icon(Icons.close, size: 16),
+                  onDeleted: () => settings.removeBlockedSender(s),
+                  backgroundColor: Colors.grey[100],
+                  side: BorderSide.none,
+                  shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(20)),
+                ),
+              ),
+              ActionChip(
+                avatar: const Icon(Icons.add, size: 18, color: AppColors.primary),
+                label: const Text('Add sender',
+                    style: TextStyle(color: AppColors.primary)),
+                onPressed: _showAddBlockedSenderDialog,
+                backgroundColor: Colors.white,
+                side: const BorderSide(color: AppColors.primary),
+                shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(20)),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildRecentSmsCard() {
+    return Container(
+      margin: const EdgeInsets.all(16),
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(16),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text('Inbox log',
+              style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+          const SizedBox(height: 4),
+          Text(
+            'Last processed SMS messages and whether they were saved',
+            style: TextStyle(color: Colors.grey[600], fontSize: 13),
+          ),
+          const SizedBox(height: 12),
+          SizedBox(
+            width: double.infinity,
+            child: OutlinedButton.icon(
+              onPressed: () {
+                Navigator.push(
+                  context,
+                  MaterialPageRoute<void>(
+                    builder: (_) => const SmsInboxLogScreen(),
+                  ),
+                );
+              },
+              icon: const Icon(Icons.sms_outlined),
+              label: const Text('View recent SMS'),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _showAddBlockedSenderDialog() {
+    _blockedSenderController.clear();
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Block sender'),
+        shape:
+            RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        content: TextField(
+          controller: _blockedSenderController,
+          autofocus: true,
+          decoration: InputDecoration(
+            hintText: 'Name or number as shown in SMS...',
+            border:
+                OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx),
+            child: const Text('Cancel'),
+          ),
+          ElevatedButton(
+            onPressed: () {
+              if (_blockedSenderController.text.trim().isNotEmpty) {
+                context
+                    .read<SettingsProvider>()
+                    .addBlockedSender(_blockedSenderController.text);
+                Navigator.pop(ctx);
+              }
+            },
+            style: ElevatedButton.styleFrom(
+              backgroundColor: AppColors.primary,
+              foregroundColor: Colors.white,
+            ),
+            child: const Text('Add'),
           ),
         ],
       ),

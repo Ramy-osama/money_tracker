@@ -9,6 +9,7 @@ import '../models/group_order.dart';
 import '../models/group_participant.dart';
 import '../models/group_item.dart';
 import '../utils/constants.dart';
+import '../models/inbox_log_entry.dart';
 
 class DbHelper {
   static final DbHelper _instance = DbHelper._internal();
@@ -29,7 +30,7 @@ class DbHelper {
 
     return await openDatabase(
       path,
-      version: 4,
+      version: 7,
       onCreate: _onCreate,
       onUpgrade: _onUpgrade,
     );
@@ -71,6 +72,8 @@ class DbHelper {
         created_at TEXT NOT NULL,
         needs_review INTEGER NOT NULL DEFAULT 0,
         parent_id INTEGER,
+        affects_parent INTEGER NOT NULL DEFAULT 0,
+        affects_total INTEGER NOT NULL DEFAULT 0,
         FOREIGN KEY (category_id) REFERENCES categories(id),
         FOREIGN KEY (account_id) REFERENCES accounts(id),
         FOREIGN KEY (parent_id) REFERENCES transactions(id) ON DELETE CASCADE
@@ -107,6 +110,8 @@ class DbHelper {
         is_active INTEGER NOT NULL DEFAULT 1
       )
     ''');
+
+    await _createSmsAuxTables(db);
 
     await _createGroupTables(db);
 
@@ -177,6 +182,79 @@ class DbHelper {
     if (oldVersion < 4) {
       await _createGroupTables(db);
     }
+    if (oldVersion < 5) {
+      await _createSmsAuxTables(db);
+      await db.execute(
+          'ALTER TABLE transactions ADD COLUMN affects_parent INTEGER NOT NULL DEFAULT 0');
+      await db.execute(
+          'ALTER TABLE transactions ADD COLUMN affects_total INTEGER NOT NULL DEFAULT 0');
+    }
+    if (oldVersion < 6) {
+      // Persistent dedup so Truecaller / re-broadcasts can't sneak past the
+      // in-memory cache (e.g., after the background isolate cold-starts).
+      await _addColumnIfMissing(
+        db,
+        table: 'sms_inbox_log',
+        column: 'body_fingerprint',
+        ddl: 'TEXT',
+      );
+      await db.execute(
+          'CREATE INDEX IF NOT EXISTS idx_sms_inbox_log_fp_time ON sms_inbox_log(body_fingerprint, received_at)');
+    }
+    if (oldVersion < 7) {
+      // Store the SMS's own OS timestamp so the SAME physical message can be
+      // recognised across processing paths (background isolate vs. inbox poll
+      // on app re-open) regardless of how much time elapsed between them.
+      await _addColumnIfMissing(
+        db,
+        table: 'sms_inbox_log',
+        column: 'sms_date',
+        ddl: 'INTEGER',
+      );
+      await db.execute(
+          'CREATE INDEX IF NOT EXISTS idx_sms_inbox_log_fp_smsdate ON sms_inbox_log(body_fingerprint, sms_date)');
+    }
+  }
+
+  Future<void> _addColumnIfMissing(
+    Database db, {
+    required String table,
+    required String column,
+    required String ddl,
+  }) async {
+    final cols = await db.rawQuery('PRAGMA table_info($table)');
+    final exists = cols.any((c) => (c['name'] as String?) == column);
+    if (!exists) {
+      await db.execute('ALTER TABLE $table ADD COLUMN $column $ddl');
+    }
+  }
+
+  Future<void> _createSmsAuxTables(Database db) async {
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS sms_sender_blocklist (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        sender TEXT NOT NULL UNIQUE,
+        created_at TEXT NOT NULL
+      )
+    ''');
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS sms_inbox_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        sender TEXT,
+        body TEXT NOT NULL,
+        received_at TEXT NOT NULL,
+        was_tracked INTEGER NOT NULL DEFAULT 0,
+        transaction_id INTEGER,
+        matched INTEGER NOT NULL DEFAULT 0,
+        blocked_sender INTEGER NOT NULL DEFAULT 0,
+        body_fingerprint TEXT,
+        sms_date INTEGER
+      )
+    ''');
+    await db.execute(
+        'CREATE INDEX IF NOT EXISTS idx_sms_inbox_log_fp_time ON sms_inbox_log(body_fingerprint, received_at)');
+    await db.execute(
+        'CREATE INDEX IF NOT EXISTS idx_sms_inbox_log_fp_smsdate ON sms_inbox_log(body_fingerprint, sms_date)');
   }
 
   Future<void> _seedData(Database db) async {
@@ -254,7 +332,7 @@ class DbHelper {
         - COALESCE(SUM(CASE WHEN type = 'expense' THEN amount ELSE 0 END), 0)
         AS balance
       FROM transactions
-      WHERE account_id = ? AND parent_id IS NULL
+      WHERE account_id = ? AND (parent_id IS NULL OR affects_total = 1)
     ''', [accountId]);
     return (result.first['balance'] as num?)?.toDouble() ?? 0.0;
   }
@@ -335,8 +413,11 @@ class DbHelper {
     final db = await database;
     final id = await db.insert('transactions', transaction.toMap());
 
-    // Only affect balance for top-level transactions
     if (transaction.parentId == null) {
+      final delta =
+          transaction.type == 'income' ? transaction.amount : -transaction.amount;
+      await updateAccountBalance(transaction.accountId, delta);
+    } else if (transaction.affectsTotal) {
       final delta =
           transaction.type == 'income' ? transaction.amount : -transaction.amount;
       await updateAccountBalance(transaction.accountId, delta);
@@ -345,10 +426,16 @@ class DbHelper {
     return id;
   }
 
-  /// Insert a sub-transaction (child) without affecting account balance.
+  /// Insert a sub-transaction. Balance updates only if [affectsTotal] is true.
   Future<int> insertSubTransaction(MoneyTransaction transaction) async {
     final db = await database;
-    return await db.insert('transactions', transaction.toMap());
+    final id = await db.insert('transactions', transaction.toMap());
+    if (transaction.affectsTotal) {
+      final delta =
+          transaction.type == 'income' ? transaction.amount : -transaction.amount;
+      await updateAccountBalance(transaction.accountId, delta);
+    }
+    return id;
   }
 
   Future<List<MoneyTransaction>> getTransactions({
@@ -394,12 +481,21 @@ class DbHelper {
     return maps.map((m) => MoneyTransaction.fromMap(m)).toList();
   }
 
+  Future<MoneyTransaction?> getTransactionById(int id) async {
+    final db = await database;
+    final maps = await db.query('transactions', where: 'id = ?', whereArgs: [id], limit: 1);
+    if (maps.isEmpty) return null;
+    return MoneyTransaction.fromMap(maps.first);
+  }
+
   Future<int> updateTransaction(MoneyTransaction oldTxn, MoneyTransaction newTxn) async {
     final db = await database;
 
-    // Reverse old transaction's effect on balance
-    final oldDelta = oldTxn.type == 'income' ? -oldTxn.amount : oldTxn.amount;
-    await updateAccountBalance(oldTxn.accountId, oldDelta);
+    final reverseOld = oldTxn.parentId == null || oldTxn.affectsTotal;
+    if (reverseOld) {
+      final oldDelta = oldTxn.type == 'income' ? -oldTxn.amount : oldTxn.amount;
+      await updateAccountBalance(oldTxn.accountId, oldDelta);
+    }
 
     final result = await db.update(
       'transactions',
@@ -408,29 +504,42 @@ class DbHelper {
       whereArgs: [newTxn.id],
     );
 
-    // Apply new transaction's effect on balance
-    final newDelta = newTxn.type == 'income' ? newTxn.amount : -newTxn.amount;
-    await updateAccountBalance(newTxn.accountId, newDelta);
+    final applyNew = newTxn.parentId == null || newTxn.affectsTotal;
+    if (applyNew) {
+      final newDelta = newTxn.type == 'income' ? newTxn.amount : -newTxn.amount;
+      await updateAccountBalance(newTxn.accountId, newDelta);
+    }
 
     return result;
   }
 
   Future<int> deleteTransaction(MoneyTransaction transaction) async {
     final db = await database;
+    final id = transaction.id;
+    if (id != null && transaction.parentId == null) {
+      final children = await getChildTransactions(id);
+      for (final c in children) {
+        if (c.affectsTotal) {
+          final delta = c.type == 'income' ? -c.amount : c.amount;
+          await updateAccountBalance(c.accountId, delta);
+        }
+      }
+    }
 
-    // Only reverse balance for top-level transactions
     if (transaction.parentId == null) {
+      final delta =
+          transaction.type == 'income' ? -transaction.amount : transaction.amount;
+      await updateAccountBalance(transaction.accountId, delta);
+    } else if (transaction.affectsTotal) {
       final delta =
           transaction.type == 'income' ? -transaction.amount : transaction.amount;
       await updateAccountBalance(transaction.accountId, delta);
     }
 
-    // Delete child transactions first
-    await db.delete('transactions',
-        where: 'parent_id = ?', whereArgs: [transaction.id]);
-
-    return await db.delete('transactions',
-        where: 'id = ?', whereArgs: [transaction.id]);
+    if (id != null) {
+      await db.delete('transactions', where: 'parent_id = ?', whereArgs: [id]);
+    }
+    return await db.delete('transactions', where: 'id = ?', whereArgs: [id]);
   }
 
   /// Re-inserts rows removed by [deleteTransaction] under their original ids,
@@ -507,19 +616,87 @@ class DbHelper {
     return counts;
   }
 
+  /// Signed adjustment to parent display from children with [affects_parent] set,
+  /// relative to the parent's type. Batch metadata: adjustment amount and count of such sub-items.
+  Future<Map<int, (double, int)>> getParentAffectData(List<int> parentIds) async {
+    if (parentIds.isEmpty) return {};
+    final db = await database;
+    final placeholders = parentIds.map((_) => '?').join(',');
+    final result = await db.rawQuery('''
+      SELECT t.parent_id,
+        COALESCE(SUM(
+          CASE WHEN t.type = p.type THEN t.amount ELSE -t.amount END
+        ), 0) AS adj,
+        COUNT(*) AS cnt
+      FROM transactions t
+      INNER JOIN transactions p ON p.id = t.parent_id
+      WHERE t.parent_id IN ($placeholders) AND t.affects_parent = 1
+      GROUP BY t.parent_id
+    ''', parentIds);
+    final out = <int, (double, int)>{};
+    for (final row in result) {
+      final id = row['parent_id'] as int;
+      final adj = (row['adj'] as num).toDouble();
+      final cnt = (row['cnt'] as int?) ?? 0;
+      out[id] = (adj, cnt);
+    }
+    return out;
+  }
+
+  Future<double> getParentAdjustment(int parentId) async {
+    final m = await getParentAffectData([parentId]);
+    return m[parentId]?.$1 ?? 0.0;
+  }
+
+  Future<Map<int, double>> getParentAdjustments(List<int> parentIds) async {
+    final m = await getParentAffectData(parentIds);
+    return {for (final e in m.entries) e.key: e.value.$1};
+  }
+
+  /// Sum of OPPOSITE-type children (with `affects_parent = 1`) per parent id.
+  ///
+  /// Used to compute the "remaining" amount of a parent transaction that is
+  /// being settled by counter-type children. Returns absolute amounts:
+  ///
+  ///   - Expense parent + Income children → returns the income total (money
+  ///     paid back so far). Remaining owed = parent.amount − total.
+  ///   - Income parent + Expense children → returns the expense total (money
+  ///     paid out so far). Remaining to distribute = parent.amount − total.
+  ///
+  /// Same-type children are excluded; they do not represent settlements.
+  Future<Map<int, double>> getOppositeTypeOffsets(List<int> parentIds) async {
+    if (parentIds.isEmpty) return {};
+    final db = await database;
+    final placeholders = parentIds.map((_) => '?').join(',');
+    final result = await db.rawQuery('''
+      SELECT t.parent_id,
+        COALESCE(SUM(t.amount), 0) AS total
+      FROM transactions t
+      INNER JOIN transactions p ON p.id = t.parent_id
+      WHERE t.parent_id IN ($placeholders)
+        AND t.affects_parent = 1
+        AND t.type <> p.type
+      GROUP BY t.parent_id
+    ''', parentIds);
+    final out = <int, double>{};
+    for (final row in result) {
+      out[row['parent_id'] as int] = (row['total'] as num).toDouble();
+    }
+    return out;
+  }
+
   Future<Map<String, double>> getMonthSummary(int year, int month) async {
     final db = await database;
     final startDate = DateTime(year, month, 1);
     final endDate = DateTime(year, month + 1, 0, 23, 59, 59);
 
-    // Exclude child transactions (parent_id IS NULL) so sub-items don't double-count
     final incomeResult = await db.rawQuery(
-      'SELECT COALESCE(SUM(amount), 0) as total FROM transactions WHERE type = ? AND date >= ? AND date <= ? AND parent_id IS NULL',
+      'SELECT COALESCE(SUM(amount), 0) as total FROM transactions WHERE type = ? AND date >= ? AND date <= ? AND (parent_id IS NULL OR affects_total = 1)',
       ['income', startDate.toIso8601String(), endDate.toIso8601String()],
     );
 
     final expenseResult = await db.rawQuery(
-      'SELECT COALESCE(SUM(amount), 0) as total FROM transactions WHERE type = ? AND date >= ? AND date <= ? AND parent_id IS NULL',
+      'SELECT COALESCE(SUM(amount), 0) as total FROM transactions WHERE type = ? AND date >= ? AND date <= ? AND (parent_id IS NULL OR affects_total = 1)',
       ['expense', startDate.toIso8601String(), endDate.toIso8601String()],
     );
 
@@ -545,7 +722,7 @@ class DbHelper {
       SELECT c.id, c.name, c.icon_name, SUM(t.amount) as total
       FROM transactions t
       JOIN categories c ON t.category_id = c.id
-      WHERE t.type = ? AND t.date >= ? AND t.date <= ? AND t.parent_id IS NULL
+      WHERE t.type = ? AND t.date >= ? AND t.date <= ? AND (t.parent_id IS NULL OR t.affects_total = 1)
       GROUP BY c.id
       ORDER BY total DESC
     ''', [type, startDate.toIso8601String(), endDate.toIso8601String()]);
@@ -571,7 +748,7 @@ class DbHelper {
           WHERE t.category_id = b.category_id
           AND t.type = 'expense'
           AND t.date >= ? AND t.date <= ?
-          AND t.parent_id IS NULL
+          AND (t.parent_id IS NULL OR t.affects_total = 1)
         ), 0) as spent
       FROM budgets b
       JOIN categories c ON b.category_id = c.id
@@ -606,7 +783,7 @@ class DbHelper {
       LEFT JOIN (
         SELECT category_id, SUM(amount) as spent
         FROM transactions
-        WHERE type = 'expense' AND date >= ? AND date <= ? AND parent_id IS NULL
+        WHERE type = 'expense' AND date >= ? AND date <= ? AND (parent_id IS NULL OR affects_total = 1)
         GROUP BY category_id
       ) spent_data ON b.category_id = spent_data.category_id
     ''', [startDate.toIso8601String(), endDate.toIso8601String()]);
@@ -663,6 +840,178 @@ class DbHelper {
     final db = await database;
     return await db.delete('sms_keywords',
         where: 'keyword = ?', whereArgs: [keyword]);
+  }
+
+  String _normalizeSenderKey(String? sender) {
+    if (sender == null) return '';
+    return sender.trim().toLowerCase();
+  }
+
+  Future<bool> isSenderBlocked(String? sender) async {
+    final key = _normalizeSenderKey(sender);
+    if (key.isEmpty) return false;
+    final db = await database;
+    final rows = await db.query(
+      'sms_sender_blocklist',
+      where: 'lower(trim(sender)) = ?',
+      whereArgs: [key],
+      limit: 1,
+    );
+    return rows.isNotEmpty;
+  }
+
+  Future<List<String>> getBlockedSenders() async {
+    final db = await database;
+    final maps = await db.query('sms_sender_blocklist',
+        orderBy: 'created_at DESC');
+    return maps.map((m) => m['sender'] as String).toList();
+  }
+
+  Future<int> addBlockedSender(String sender) async {
+    final db = await database;
+    final key = _normalizeSenderKey(sender);
+    if (key.isEmpty) return 0;
+    return await db.insert(
+      'sms_sender_blocklist',
+      {
+        'sender': key,
+        'created_at': DateTime.now().toIso8601String(),
+      },
+      conflictAlgorithm: ConflictAlgorithm.ignore,
+    );
+  }
+
+  Future<int> removeBlockedSender(String sender) async {
+    final db = await database;
+    return await db.delete(
+      'sms_sender_blocklist',
+      where: 'lower(trim(sender)) = ?',
+      whereArgs: [_normalizeSenderKey(sender)],
+    );
+  }
+
+  Future<void> logIncomingSms({
+    String? sender,
+    required String body,
+    required bool wasTracked,
+    int? transactionId,
+    required bool matched,
+    bool blockedSender = false,
+    String? receivedAt,
+    String? bodyFingerprint,
+    int? smsDate,
+  }) async {
+    final db = await database;
+    final at = receivedAt ?? DateTime.now().toIso8601String();
+    await db.insert('sms_inbox_log', {
+      'sender': sender == null || sender.isEmpty ? '' : sender,
+      'body': body,
+      'received_at': at,
+      'was_tracked': wasTracked ? 1 : 0,
+      'transaction_id': transactionId,
+      'matched': matched ? 1 : 0,
+      'blocked_sender': blockedSender ? 1 : 0,
+      'body_fingerprint': bodyFingerprint,
+      'sms_date': smsDate,
+    });
+    final countRow = await db.rawQuery('SELECT COUNT(*) as c FROM sms_inbox_log');
+    final c = (countRow.first['c'] as int?) ?? 0;
+    if (c > 200) {
+      final toDelete = c - 200;
+      await db.rawDelete(
+        'DELETE FROM sms_inbox_log WHERE id IN (SELECT id FROM sms_inbox_log ORDER BY id ASC LIMIT ?)',
+        [toDelete],
+      );
+    }
+  }
+
+  /// Returns the transaction id of the most recent SMS that was successfully
+  /// tracked AND has the given fingerprint AND was received within
+  /// [withinSeconds] of [now]. Used to detect Truecaller / re-broadcast
+  /// duplicates that present the same financial content with a slightly
+  /// different SMS body.
+  ///
+  /// Returns `null` if no such recent duplicate exists.
+  Future<int?> findRecentTrackedTransactionByFingerprint({
+    required String fingerprint,
+    required int withinSeconds,
+    DateTime? now,
+  }) async {
+    if (fingerprint.isEmpty) return null;
+    final db = await database;
+    final ref = (now ?? DateTime.now()).toUtc();
+    final cutoff = ref.subtract(Duration(seconds: withinSeconds));
+    // We compare ISO8601 strings lexicographically — only safe when both
+    // sides are in UTC (Z suffix) or both in local with the same offset.
+    // We persist whatever the caller supplied (typically local time without
+    // offset), so use a wider numeric comparison via julianday for safety.
+    final rows = await db.rawQuery(
+      '''
+      SELECT transaction_id
+      FROM sms_inbox_log
+      WHERE body_fingerprint = ?
+        AND was_tracked = 1
+        AND transaction_id IS NOT NULL
+        AND julianday(received_at) >= julianday(?)
+      ORDER BY id DESC
+      LIMIT 1
+      ''',
+      [fingerprint, cutoff.toIso8601String()],
+    );
+    if (rows.isEmpty) return null;
+    final raw = rows.first['transaction_id'];
+    if (raw is int) return raw;
+    return null;
+  }
+
+  /// Returns the transaction id of an already-tracked SMS that is the SAME
+  /// physical message as the incoming one, identified by an exact match on
+  /// both the content [fingerprint] and the SMS's own OS timestamp [smsDate].
+  ///
+  /// Unlike [findRecentTrackedTransactionByFingerprint], this is NOT time
+  /// windowed: the SMS timestamp is assigned once by the OS and is identical
+  /// whether the message is first seen by the background isolate (app killed)
+  /// or re-read later by the inbox poll (app re-opened). This is what stops a
+  /// message detected in the background from being saved a second time when
+  /// the app is opened — even hours later.
+  ///
+  /// Two genuinely separate purchases produce different SMS timestamps, so
+  /// this never collapses real repeat transactions.
+  ///
+  /// Returns `null` if this exact message was not previously tracked.
+  Future<int?> findTrackedTransactionBySmsIdentity({
+    required String fingerprint,
+    required int smsDate,
+  }) async {
+    if (fingerprint.isEmpty) return null;
+    final db = await database;
+    final rows = await db.rawQuery(
+      '''
+      SELECT transaction_id
+      FROM sms_inbox_log
+      WHERE body_fingerprint = ?
+        AND sms_date = ?
+        AND was_tracked = 1
+        AND transaction_id IS NOT NULL
+      ORDER BY id DESC
+      LIMIT 1
+      ''',
+      [fingerprint, smsDate],
+    );
+    if (rows.isEmpty) return null;
+    final raw = rows.first['transaction_id'];
+    if (raw is int) return raw;
+    return null;
+  }
+
+  Future<List<InboxLogEntry>> getRecentInboxLog({int limit = 50}) async {
+    final db = await database;
+    final maps = await db.query(
+      'sms_inbox_log',
+      orderBy: 'id DESC',
+      limit: limit,
+    );
+    return maps.map((m) => InboxLogEntry.fromMap(m)).toList();
   }
 
   // ─── Group Order CRUD ───

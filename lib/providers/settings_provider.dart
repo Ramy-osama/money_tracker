@@ -5,6 +5,7 @@ import 'package:csv/csv.dart';
 import 'dart:io';
 import '../database/db_helper.dart';
 import '../models/category.dart';
+import '../models/inbox_log_entry.dart';
 import '../services/sms_service.dart';
 import '../services/sms_auto_saver.dart';
 
@@ -13,6 +14,7 @@ class SettingsProvider with ChangeNotifier {
   final SmsService _smsService = SmsService();
 
   List<String> _smsKeywords = [];
+  List<String> _blockedSenders = [];
   bool _smsTrackingEnabled = false;
   String _currency = 'EGP';
   List<Category> _categories = [];
@@ -22,6 +24,7 @@ class SettingsProvider with ChangeNotifier {
   int? _smsTargetIncomeCategoryId;
 
   List<String> get smsKeywords => _smsKeywords;
+  List<String> get blockedSenders => _blockedSenders;
   bool get smsTrackingEnabled => _smsTrackingEnabled;
   String get currency => _currency;
   List<Category> get categories => _categories;
@@ -42,6 +45,7 @@ class SettingsProvider with ChangeNotifier {
     _smsTargetIncomeCategoryId =
         prefs.getInt(SmsAutoSaver.prefsKeySmsCategoryIncomeId);
     _smsKeywords = await _db.getSmsKeywords();
+    _blockedSenders = await _db.getBlockedSenders();
     _categories = await _db.getCategories();
     // Mirror keywords into SharedPreferences so the background isolate
     // can read them without hitting sqflite during cold start.
@@ -119,6 +123,24 @@ class SettingsProvider with ChangeNotifier {
     _smsKeywords = await _db.getSmsKeywords();
     await _smsService.updateKeywords(_smsKeywords);
     notifyListeners();
+  }
+
+  Future<void> addBlockedSender(String sender) async {
+    final t = sender.trim();
+    if (t.isEmpty) return;
+    await _db.addBlockedSender(t);
+    _blockedSenders = await _db.getBlockedSenders();
+    notifyListeners();
+  }
+
+  Future<void> removeBlockedSender(String sender) async {
+    await _db.removeBlockedSender(sender);
+    _blockedSenders = await _db.getBlockedSenders();
+    notifyListeners();
+  }
+
+  Future<List<InboxLogEntry>> getRecentInboxLog({int limit = 50}) {
+    return _db.getRecentInboxLog(limit: limit);
   }
 
   Future<void> setCurrency(String currency) async {

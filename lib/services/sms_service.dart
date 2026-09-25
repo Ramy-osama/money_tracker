@@ -50,9 +50,16 @@ class SmsService {
   bool get isListening => _isListening;
   List<String> get activeKeywords => List.unmodifiable(_activeKeywords);
 
-  /// Returns true if this body was already processed recently (dedup)
-  bool _isDuplicate(String body) {
-    final key = body.hashCode.toString();
+  /// Returns true if this body was already processed recently (dedup).
+  ///
+  /// We key off [SmsParser.fingerprintForDedup] rather than the raw body so
+  /// that Truecaller / re-broadcast wrappers (which add caller-info text
+  /// around the original bank message) collapse to the same dedup key as
+  /// the original. Falls back to body hash when no fingerprint is available
+  /// (very short or non-matching messages).
+  bool _isDuplicate(String body, {String? sender}) {
+    final fp = SmsParser.fingerprintForDedup(body, sender: sender);
+    final key = fp.isNotEmpty ? fp : 'raw:${body.hashCode}';
     if (_recentlyProcessed.contains(key)) return true;
     _recentlyProcessed.add(key);
     if (_recentlyProcessed.length > 30) {
@@ -167,7 +174,7 @@ class SmsService {
 
         final preview = body.substring(0, body.length > 60 ? 60 : body.length);
 
-        if (_isDuplicate(body)) {
+        if (_isDuplicate(body, sender: msg.address)) {
           _log('poll', 'Skipped duplicate from ${msg.address ?? "?"}: $preview...');
           continue;
         }
@@ -178,6 +185,7 @@ class SmsService {
         final saved = await SmsAutoSaver.handleIncomingSms(
           body: body,
           sender: msg.address,
+          smsDate: msgDate,
         );
 
         if (saved) {
@@ -206,9 +214,18 @@ class SmsService {
     final body = message.body;
     if (body == null || body.isEmpty) return;
 
-    _isDuplicate(body); // Mark as seen so poll skips it
-
     final preview = body.substring(0, body.length > 60 ? 60 : body.length);
+
+    // First-line in-memory dedup: catches Truecaller's near-instant
+    // re-broadcast in the foreground isolate without hitting the DB.
+    // SmsAutoSaver does a persistent fingerprint check too, which is the
+    // authoritative dedup (works after cold-start and across isolates).
+    if (_isDuplicate(body, sender: message.address)) {
+      _log('broadcast',
+          'Skipped duplicate from ${message.address ?? "?"}: $preview...');
+      return;
+    }
+
     _log('broadcast', 'RECEIVED from ${message.address ?? "?"}: $preview...');
 
     // Update timestamp so polling doesn't re-process
@@ -223,6 +240,7 @@ class SmsService {
     final saved = await SmsAutoSaver.handleIncomingSms(
       body: body,
       sender: message.address,
+      smsDate: message.date,
     );
 
     if (saved) {
@@ -334,5 +352,6 @@ Future<void> smsBackgroundMessageHandler(SmsMessage message) async {
   await SmsAutoSaver.handleIncomingSms(
     body: body,
     sender: message.address,
+    smsDate: message.date,
   );
 }

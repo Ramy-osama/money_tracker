@@ -15,6 +15,96 @@ class SmsParseResult {
 }
 
 class SmsParser {
+  /// Truecaller and similar SMS classifier apps re-broadcast the original
+  /// bank message wrapped in extra annotation text (caller info, "Reported
+  /// safe by N users", spam/category labels, separator dashes, etc.). The
+  /// stripped substrings below are matched case-insensitively and removed
+  /// before fingerprinting so the wrapped copy hashes the same as the
+  /// original bank SMS.
+  static final List<RegExp> _wrapperStripPatterns = [
+    // Truecaller line markers
+    RegExp(r'truecaller', caseSensitive: false),
+    RegExp(r'reported\s+safe(?:\s+by\s+\d+\s+users?)?', caseSensitive: false),
+    RegExp(r'reported\s+as\s+spam(?:\s+by\s+\d+\s+users?)?',
+        caseSensitive: false),
+    RegExp(r'spam\s+score[:\s]+\d+', caseSensitive: false),
+    RegExp(r'identified\s+as[:\s].*', caseSensitive: false),
+    // SMS app forwarding artefacts
+    RegExp(r'^\s*from[:\s].*$', caseSensitive: false, multiLine: true),
+    RegExp(r'^\s*sender[:\s].*$', caseSensitive: false, multiLine: true),
+    RegExp(r'^\s*forwarded\s+message.*$', caseSensitive: false, multiLine: true),
+    // Visual separators that wrappers commonly add
+    RegExp(r'[─━═\-]{3,}'),
+  ];
+
+  /// Build a stable fingerprint suitable for cross-isolate, time-windowed
+  /// duplicate detection.
+  ///
+  /// Strategy: the fingerprint is built from the **content that is
+  /// invariant across re-broadcasts** rather than from the raw body, so
+  /// that Truecaller-wrapped copies of the same bank SMS collapse to the
+  /// same key. We use:
+  ///   - the extracted amount (cents-precision integer)
+  ///   - the inferred type (income/expense)
+  ///   - a normalized excerpt of the body with wrapper text removed,
+  ///     whitespace collapsed, Arabic-Indic digits folded to ASCII,
+  ///     and case-folded
+  ///
+  /// Returns an empty string when no usable signal is present (caller
+  /// should treat empty as "no fingerprint, do not dedupe").
+  static String fingerprintForDedup(String body, {String? sender}) {
+    if (body.isEmpty) return '';
+    final normalized = _normalizeForFingerprint(body);
+    if (normalized.isEmpty) return '';
+
+    final amount = _extractAmount(body);
+    final type = _determineType(body);
+
+    // Cap the normalized excerpt to keep the key bounded but distinctive.
+    final excerptLen = normalized.length > 240 ? 240 : normalized.length;
+    final excerpt = normalized.substring(0, excerptLen);
+
+    final amountKey = amount == null
+        ? 'na'
+        : (amount * 100).round().toString(); // cents
+    return '$type|$amountKey|$excerpt';
+  }
+
+  static String _normalizeForFingerprint(String body) {
+    var s = body;
+    for (final p in _wrapperStripPatterns) {
+      s = s.replaceAll(p, ' ');
+    }
+    s = _foldArabicIndicDigits(s);
+    s = s.toLowerCase();
+    // Strip every char that isn't a letter (any script), digit, or '.'
+    // Keeping '.' preserves decimal amounts.
+    s = s.replaceAll(RegExp(r"[^\p{L}\p{N}.]+", unicode: true), ' ');
+    s = s.replaceAll(RegExp(r'\s+'), ' ').trim();
+    return s;
+  }
+
+  static String _foldArabicIndicDigits(String s) {
+    const arabicIndic = '٠١٢٣٤٥٦٧٨٩';
+    const easternArabicIndic = '۰۱۲۳۴۵۶۷۸۹';
+    final buf = StringBuffer();
+    for (final r in s.runes) {
+      final ch = String.fromCharCode(r);
+      final ai = arabicIndic.indexOf(ch);
+      if (ai >= 0) {
+        buf.write(ai.toString());
+        continue;
+      }
+      final ei = easternArabicIndic.indexOf(ch);
+      if (ei >= 0) {
+        buf.write(ei.toString());
+        continue;
+      }
+      buf.write(ch);
+    }
+    return buf.toString();
+  }
+
   static final List<RegExp> _amountPatterns = [
     // AlAhly / Arabic bank: "تم خصم 500 جم" or "تم إضافة 500 جم"
     RegExp(r'تم\s+خصم\s*([\d,]+\.?\d*)', caseSensitive: false),
@@ -84,12 +174,82 @@ class SmsParser {
     'مبروك', 'فوز', 'اربح', 'جائزة', 'مجاني', 'كود التفعيل',
     'offer', 'subscribe', 'win', 'free', 'promo', 'discount',
     'activate your', 'congratulations',
+    'big savings', 'limited time', 'use code', '% off', 'save up to',
+    'voucher', 'coupon', 'cashback offer',
+    'mins!',
     // OTP / verification
     'otp', 'verify', 'verification code', 'one-time', 'one time password',
     'كلمة السر', 'رمز التحقق', 'رمز التأكيد',
     // Informational / non-transaction
     'تفعيل', 'اشتراك', 'كود',
   ];
+
+  /// High-signal retail/marketing fragments (EN + AR). Scored, not all single-shot excludes.
+  static const List<String> _promoScoreSubstrings = [
+    'big savings',
+    'limited time',
+    'use code',
+    '% off',
+    'save up to',
+    'voucher',
+    'coupon',
+    'cashback offer',
+    'groceries',
+    ' minutes',
+    ' mins',
+    'mins!',
+    'كوبون',
+    'وفر',
+    'خصم %',
+    'استخدم كود',
+    'كود الخصم',
+    'استخدم الكود',
+  ];
+
+  /// If this returns `true`, the message is treated as non-transactional even when
+  /// amount and bank-style keywords match (e.g. “EGP 150” in a promo blurb).
+  static bool isLikelyPromotional(String body) {
+    if (body.isEmpty) return false;
+    final lower = body.toLowerCase();
+    int score = 0;
+    for (final p in _promoScoreSubstrings) {
+      if (lower.contains(p)) score++;
+    }
+    if (_startsWithAllCapsBlurb(body)) score++;
+    if (_multipleExclaimNearDiscount(body)) score++;
+    return score >= 2;
+  }
+
+  static bool _startsWithAllCapsBlurb(String body) {
+    final firstLine = body.split(RegExp(r'[\r\n]')).first.trim();
+    if (firstLine.length < 8) return false;
+    final take = firstLine.length > 48 ? 48 : firstLine.length;
+    final head = firstLine.substring(0, take);
+    int letters = 0;
+    int upperLetters = 0;
+    for (final rune in head.runes) {
+      final c = String.fromCharCode(rune);
+      if (RegExp(r'[A-Z]').hasMatch(c)) {
+        upperLetters++;
+        letters++;
+      } else if (RegExp(r'[a-z]').hasMatch(c)) {
+        letters++;
+      }
+    }
+    if (letters < 5) return false;
+    return upperLetters >= (letters * 0.75).round();
+  }
+
+  static bool _multipleExclaimNearDiscount(String body) {
+    final exclaim = '!'.allMatches(body).length;
+    if (exclaim <= 1) return false;
+    final lower = body.toLowerCase();
+    final nearDiscount = lower.contains('%') ||
+        lower.contains(' off') ||
+        lower.contains('خصم') ||
+        RegExp(r'\d+\s*%').hasMatch(body);
+    return nearDiscount;
+  }
 
   static bool containsKeyword(String body, List<String> keywords) {
     final lowerBody = body.toLowerCase();
@@ -99,6 +259,10 @@ class SmsParser {
   static SmsParseResult parse(String body, List<String> activeKeywords) {
     // Early exit: skip promotional, OTP, and non-transactional messages
     if (containsKeyword(body, _excludeKeywords)) {
+      return SmsParseResult(rawBody: body, matched: false);
+    }
+
+    if (isLikelyPromotional(body)) {
       return SmsParseResult(rawBody: body, matched: false);
     }
 

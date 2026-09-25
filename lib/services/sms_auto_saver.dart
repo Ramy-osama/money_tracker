@@ -26,11 +26,27 @@ class SmsAutoSaver {
   static const String prefsKeyKeywords = 'sms_active_keywords';
   static const String prefsKeyEnabled = 'sms_tracking_enabled';
 
+  /// How recent a previously-tracked SMS with the same fingerprint must be
+  /// to be considered a re-broadcast/Truecaller duplicate.
+  ///
+  /// 5 minutes is wide enough to cover Truecaller's classification delay
+  /// (typically <60s) plus polling fallback (15s cadence) without being so
+  /// wide that legitimately repeated bank notifications later in the day
+  /// (e.g., two separate purchases of the same amount at the same merchant)
+  /// get dropped. A real second purchase will almost always be > 5min apart.
+  static const int dedupWindowSeconds = 300;
+
   /// Parse a raw SMS body and persist a transaction if it matches.
   /// Returns true if a transaction was saved.
+  ///
+  /// [smsDate] is the message's own OS timestamp (milliseconds since epoch),
+  /// taken from the platform SMS record. It is stable across processing paths
+  /// (background isolate vs. inbox poll), so it is the key signal used to stop
+  /// the same physical message from being saved twice.
   static Future<bool> handleIncomingSms({
     required String body,
     String? sender,
+    int? smsDate,
   }) async {
     if (body.isEmpty) return false;
 
@@ -41,23 +57,150 @@ class SmsAutoSaver {
       return false;
     }
 
+    final db = DbHelper();
+    final receivedAt = DateTime.now().toIso8601String();
+
+    Future<void> log({
+      required bool wasTracked,
+      int? transactionId,
+      required bool matched,
+      bool blockedSender = false,
+      String? bodyFingerprint,
+    }) async {
+      try {
+        await db.logIncomingSms(
+          sender: sender,
+          body: body,
+          wasTracked: wasTracked,
+          transactionId: transactionId,
+          matched: matched,
+          blockedSender: blockedSender,
+          receivedAt: receivedAt,
+          bodyFingerprint: bodyFingerprint,
+          smsDate: smsDate,
+        );
+      } catch (e) {
+        debugPrint('SmsAutoSaver: log failed: $e');
+      }
+    }
+
+    if (await db.isSenderBlocked(sender)) {
+      await log(
+        wasTracked: false,
+        matched: false,
+        blockedSender: true,
+      );
+      debugPrint('SmsAutoSaver: sender blocked, skipping');
+      return false;
+    }
+
     final keywords = prefs.getStringList(prefsKeyKeywords) ?? const <String>[];
 
     final result = SmsParser.parse(body, keywords);
     if (!result.matched || result.amount == null || result.amount! <= 0) {
+      await log(
+        wasTracked: false,
+        matched: result.matched,
+        blockedSender: false,
+      );
       return false;
     }
 
-    final db = DbHelper();
+    final fingerprint = SmsParser.fingerprintForDedup(body, sender: sender);
+
+    // Identity dedup (the primary defense against the "detected in background,
+    // detected again on app open" duplication).
+    //
+    // The same physical SMS is seen by two independent paths: the background
+    // isolate when the app is killed, and the inbox poll when the app is
+    // re-opened. Both observe the OS-assigned [smsDate], which never changes.
+    // If we've already tracked a transaction for this exact (fingerprint,
+    // smsDate) pair, this is a re-read of a message we already saved — skip it
+    // no matter how long ago that was. This is what the time-windowed check
+    // below cannot do once the app is opened more than [dedupWindowSeconds]
+    // after the background save.
+    if (smsDate != null && fingerprint.isNotEmpty) {
+      try {
+        final existingTxnId = await db.findTrackedTransactionBySmsIdentity(
+          fingerprint: fingerprint,
+          smsDate: smsDate,
+        );
+        if (existingTxnId != null) {
+          debugPrint(
+            'SmsAutoSaver: same SMS already tracked (identity match → '
+            'tx#$existingTxnId, smsDate=$smsDate), skipping insert',
+          );
+          await log(
+            wasTracked: false,
+            matched: true,
+            blockedSender: false,
+            bodyFingerprint: fingerprint,
+          );
+          return false;
+        }
+      } catch (e) {
+        debugPrint('SmsAutoSaver: identity dedup lookup failed: $e');
+      }
+    }
+
+    // Persistent, isolate-safe duplicate check (re-broadcast wrappers).
+    //
+    // Truecaller (and similar SMS classifier apps) re-broadcasts the
+    // original bank SMS wrapped in extra annotation text, arriving as a
+    // distinct message with its own (later) timestamp. The body looks
+    // different to the OS so the in-memory dedup in SmsService does not
+    // catch it, and on cold-start the background isolate has no in-memory
+    // history at all. We persist a normalized fingerprint per processed SMS
+    // and reject any incoming SMS whose fingerprint matches a recently
+    // tracked one.
+    if (fingerprint.isNotEmpty) {
+      try {
+        final existingTxnId = await db.findRecentTrackedTransactionByFingerprint(
+          fingerprint: fingerprint,
+          withinSeconds: dedupWindowSeconds,
+        );
+        if (existingTxnId != null) {
+          debugPrint(
+            'SmsAutoSaver: duplicate SMS detected (fingerprint match → '
+            'tx#$existingTxnId, sender=${sender ?? "?"}), skipping insert',
+          );
+          await log(
+            wasTracked: false,
+            matched: true,
+            blockedSender: false,
+            bodyFingerprint: fingerprint,
+          );
+          return false;
+        }
+      } catch (e) {
+        // Dedup is a best-effort optimisation; on failure, fall through
+        // and let the regular insert path run. Worst case we record one
+        // duplicate, which is still recoverable from the inbox log.
+        debugPrint('SmsAutoSaver: dedup lookup failed: $e');
+      }
+    }
+
     final accounts = await db.getAccounts();
     if (accounts.isEmpty) {
       debugPrint('SmsAutoSaver: no accounts configured, skipping');
+      await log(
+        wasTracked: false,
+        matched: true,
+        blockedSender: false,
+        bodyFingerprint: fingerprint,
+      );
       return false;
     }
 
     final categories = await db.getCategories();
     if (categories.isEmpty) {
       debugPrint('SmsAutoSaver: no categories configured, skipping');
+      await log(
+        wasTracked: false,
+        matched: true,
+        blockedSender: false,
+        bodyFingerprint: fingerprint,
+      );
       return false;
     }
 
@@ -91,23 +234,46 @@ class SmsAutoSaver {
         ? result.merchant!
         : body.substring(0, body.length > 50 ? 50 : body.length);
 
+    // Date the transaction by when the SMS actually arrived, not when we got
+    // around to processing it. For background detection these are nearly the
+    // same, but a message recovered by the poll on app re-open could otherwise
+    // be stamped well after the real event (even into the wrong month).
+    final transactionDate = smsDate != null
+        ? DateTime.fromMillisecondsSinceEpoch(smsDate)
+        : DateTime.now();
+
     final transaction = MoneyTransaction(
       amount: result.amount!,
       type: type,
       categoryId: categoryId,
       accountId: accountId,
       description: description,
-      date: DateTime.now(),
+      date: transactionDate,
       source: 'sms',
       needsReview: true,
     );
 
+    int? newId;
     try {
-      await db.insertTransaction(transaction);
+      newId = await db.insertTransaction(transaction);
     } catch (e) {
       debugPrint('SmsAutoSaver: failed to insert transaction: $e');
+      await log(
+        wasTracked: false,
+        matched: true,
+        blockedSender: false,
+        bodyFingerprint: fingerprint,
+      );
       return false;
     }
+
+    await log(
+      wasTracked: true,
+      transactionId: newId,
+      matched: true,
+      blockedSender: false,
+      bodyFingerprint: fingerprint,
+    );
 
     try {
       await NotificationService().showSmsTransactionNotification(

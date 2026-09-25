@@ -14,6 +14,9 @@ class TransactionProvider with ChangeNotifier {
   DateTime _selectedMonth = DateTime.now();
   bool _isLoading = false;
   Map<int, int> _childCounts = {};
+  Map<int, double> _parentAdjustments = {};
+  Map<int, int> _affectsParentSubItemCounts = {};
+  Map<int, double> _oppositeTypeOffsets = {};
 
   List<MoneyTransaction> get transactions => _transactions;
   Map<String, double> get monthSummary => _monthSummary;
@@ -69,6 +72,10 @@ class TransactionProvider with ChangeNotifier {
         .map((t) => t.id!)
         .toList();
     _childCounts = await _db.getChildCounts(parentIds);
+    final affect = await _db.getParentAffectData(parentIds);
+    _parentAdjustments = {for (final e in affect.entries) e.key: e.value.$1};
+    _affectsParentSubItemCounts = {for (final e in affect.entries) e.key: e.value.$2};
+    _oppositeTypeOffsets = await _db.getOppositeTypeOffsets(parentIds);
   }
 
   Future<void> _loadSummary() async {
@@ -93,6 +100,43 @@ class TransactionProvider with ChangeNotifier {
   }
 
   int getChildCount(int transactionId) => _childCounts[transactionId] ?? 0;
+
+  double parentAdjustmentFor(int parentId) =>
+      _parentAdjustments[parentId] ?? 0.0;
+
+  int affectsParentSubItemCountFor(int parentId) =>
+      _affectsParentSubItemCounts[parentId] ?? 0;
+
+  /// Sum of opposite-type children (with affects_parent=1) collected so far.
+  /// 0 if none — meaning this parent has no settlement-style children.
+  double oppositeTypeOffsetFor(int parentId) =>
+      _oppositeTypeOffsets[parentId] ?? 0.0;
+
+  /// True iff [parent] has at least one opposite-type child marked
+  /// `affects_parent`. Used to decide whether to show the "remaining" line.
+  bool hasOppositeTypeChildren(MoneyTransaction parent) {
+    if (parent.id == null) return false;
+    return (_oppositeTypeOffsets[parent.id!] ?? 0.0) > 0;
+  }
+
+  /// Money still outstanding on [parent]:
+  ///   - Expense parent: amount you laid out minus what people have paid back.
+  ///   - Income parent: amount you received minus what you've paid out.
+  /// Clamped to 0 (overpayment doesn't make remaining go negative).
+  /// Returns 0 if there are no opposite-type children (nothing to settle).
+  double remainingFor(MoneyTransaction parent) {
+    if (!hasOppositeTypeChildren(parent)) return 0;
+    final offset = _oppositeTypeOffsets[parent.id!] ?? 0.0;
+    final remaining = parent.amount - offset;
+    return remaining < 0 ? 0 : remaining;
+  }
+
+  /// True when opposite-type children fully (or more than) cover the parent.
+  bool isSettled(MoneyTransaction parent) {
+    if (!hasOppositeTypeChildren(parent)) return false;
+    final offset = _oppositeTypeOffsets[parent.id!] ?? 0.0;
+    return offset >= parent.amount;
+  }
 
   Future<List<MoneyTransaction>> getChildTransactions(int parentId) async {
     return _db.getChildTransactions(parentId);

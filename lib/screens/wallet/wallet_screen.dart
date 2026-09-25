@@ -373,6 +373,15 @@ class _WalletScreenState extends State<WalletScreen> {
             onDelete: () => deleteTransactionsWithUndo(context, [txn.id!]),
             onAddSubTransaction: (parent) => _showAddSubTransactionDialog(parent),
             onBreakDown: (parent) => _showAddSubTransactionDialog(parent),
+            onEditSubTransaction: (child, parent) {
+              showDialog(
+                context: context,
+                builder: (_) => AddTransactionDialog(
+                  existingTransaction: child,
+                  parentTransaction: parent,
+                ),
+              );
+            },
             onMarkReviewed: () async {
               await provider.markReviewed(txn);
               if (mounted) {
